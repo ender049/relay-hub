@@ -1,0 +1,24 @@
+name: Validate
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  extension:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check JavaScript syntax
+        run: |
+          node --check src/app.js
+          node --check src/background.js
+          node --check src/shell.js
+
+      - name: Build extension zip
+        run: |
+          mkdir -p dist
+          python3 -m zipfile -c dist/relay-hub-extension.zip manifest.json src/background.js pages/popup.html pages/sidepanel.html src/shell.js pages/index.html src/app.js assets/relayhub.png
+          python3 -m zipfile -t dist/relay-hub-extension.zip

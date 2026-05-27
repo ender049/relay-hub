@@ -1,0 +1,25 @@
+# Packaged extension artifacts
+*.zip
+*.crx
+*.pem
+*.xpi
+dist/
+build/
+
+# Local browser/test artifacts
+.playwright-mcp/
+playwright-report/
+test-results/
+*.log
+
+# Local screenshots may contain private account data
+relay-hub-*-ui.png
+screenshots/
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
