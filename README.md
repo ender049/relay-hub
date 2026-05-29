@@ -126,7 +126,24 @@ node --check src/shell.js
 
 ```bash
 mkdir -p dist
-python3 -m zipfile -c dist/relay-hub-extension.zip manifest.json src/background.js pages/popup.html pages/sidepanel.html src/shell.js pages/index.html src/app.js assets/relayhub.png
+python3 - <<'PY'
+import zipfile
+
+files = [
+    'manifest.json',
+    'src/background.js',
+    'pages/popup.html',
+    'pages/sidepanel.html',
+    'src/shell.js',
+    'pages/index.html',
+    'src/app.js',
+    'assets/relayhub.png',
+]
+
+with zipfile.ZipFile('dist/relay-hub-extension.zip', 'w', zipfile.ZIP_DEFLATED) as z:
+    for file in files:
+        z.write(file, file)
+PY
 python3 -m zipfile -t dist/relay-hub-extension.zip
 ```
 
