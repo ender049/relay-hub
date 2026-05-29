@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Relay Hub",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Manage CPA credentials and New API/Sub2API upstream channels.",
   "permissions": ["storage", "sidePanel", "tabs"],
   "host_permissions": ["<all_urls>"],
