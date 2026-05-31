@@ -40,6 +40,7 @@ src/background.js
 | `pages/index.html` | 主 UI、CSS、模态框和 SVG 图标 |
 | `src/app.js` | 状态、渲染、CPA / 渠道请求、自动刷新和交互逻辑 |
 | `assets/relayhub.png` | 扩展图标 |
+| `scripts/package-extension.py` | 官方扩展打包脚本，保留 zip 内目录结构 |
 
 ## 数据流
 
@@ -165,30 +166,13 @@ node --check src/background.js
 node --check src/shell.js
 ```
 
-打包扩展：
+官方打包命令：
 
 ```bash
-mkdir -p dist
-python3 - <<'PY'
-import zipfile
-
-files = [
-    'manifest.json',
-    'src/background.js',
-    'pages/popup.html',
-    'pages/sidepanel.html',
-    'src/shell.js',
-    'pages/index.html',
-    'src/app.js',
-    'assets/relayhub.png',
-]
-
-with zipfile.ZipFile('dist/relay-hub-extension.zip', 'w', zipfile.ZIP_DEFLATED) as z:
-    for file in files:
-        z.write(file, file)
-PY
-python3 -m zipfile -t dist/relay-hub-extension.zip
+python3 scripts/package-extension.py
 ```
+
+产物为 `dist/relay-hub-extension.zip`。压缩包内必须包含 `manifest.json`、`pages/index.html`、`src/app.js`、`assets/relayhub.png` 等原始相对路径。不要使用 `python3 -m zipfile -c ...` 手动打包，因为它可能压平目录结构，导致扩展重新加载后仍不是最新代码。
 
 本地静态预览仅用于查看 UI，渠道跨域和扩展权限相关能力需要在浏览器扩展环境中测试。
 
@@ -200,6 +184,7 @@ python3 -m http.server 8080
 
 - `node --check src/app.js src/background.js src/shell.js` 全部通过。
 - `manifest.json` 版本号已更新。
+- 使用 `python3 scripts/package-extension.py` 生成发布 zip，并确认 zip 内保留 `pages/`、`src/`、`assets/` 目录。
 - README 功能说明仍与当前 UI 一致；如添加截图，必须先使用脱敏示例数据。
 - 不提交 `dist/`、`.crx`、`.pem`、`.playwright-mcp/` 等本地或打包产物。
 - 如需分发 zip，把压缩包作为 GitHub Release asset 上传。

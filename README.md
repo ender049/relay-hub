@@ -98,6 +98,8 @@ Relay Hub 不注入网页内容，不做遥测，不把配置上传到第三方�
 │   ├── background.js      # 扩展后台，请求转发和跨域访问
 │   ├── shell.js           # 外壳逻辑，存储同步、复制、请求桥接
 │   └── app.js             # 主要状态、渲染、请求和交互逻辑
+├── scripts/
+│   └── package-extension.py # 官方扩展打包脚本
 ├── pages/
 │   ├── popup.html         # popup 外壳
 │   ├── sidepanel.html     # side panel 外壳
@@ -122,30 +124,13 @@ node --check src/background.js
 node --check src/shell.js
 ```
 
-打包 zip：
+官方打包命令：
 
 ```bash
-mkdir -p dist
-python3 - <<'PY'
-import zipfile
-
-files = [
-    'manifest.json',
-    'src/background.js',
-    'pages/popup.html',
-    'pages/sidepanel.html',
-    'src/shell.js',
-    'pages/index.html',
-    'src/app.js',
-    'assets/relayhub.png',
-]
-
-with zipfile.ZipFile('dist/relay-hub-extension.zip', 'w', zipfile.ZIP_DEFLATED) as z:
-    for file in files:
-        z.write(file, file)
-PY
-python3 -m zipfile -t dist/relay-hub-extension.zip
+python3 scripts/package-extension.py
 ```
+
+产物为 `dist/relay-hub-extension.zip`。压缩包必须保留 `pages/`、`src/`、`assets/` 目录结构，不要使用 `python3 -m zipfile -c ...` 手动打包。
 
 更多开发细节见 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)。
 
