@@ -1,3 +1,35 @@
+const OPEN_MODE_KEY = 'relay_open_mode';
+const POPUP_PATH = 'pages/popup.html';
+
+applyOpenMode();
+chrome.runtime.onInstalled.addListener(applyOpenMode);
+chrome.runtime.onStartup.addListener(applyOpenMode);
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === 'local' && changes[OPEN_MODE_KEY]) applyOpenMode();
+});
+
+async function applyOpenMode() {
+  try {
+    const data = await chrome.storage.local.get(OPEN_MODE_KEY);
+    const mode = normalizeOpenMode(data[OPEN_MODE_KEY]);
+    if (mode === 'sidepanel' && chrome.sidePanel && chrome.sidePanel.setPanelBehavior) {
+      await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
+      await chrome.action.setPopup({ popup: '' });
+    } else {
+      await chrome.action.setPopup({ popup: POPUP_PATH });
+      if (chrome.sidePanel && chrome.sidePanel.setPanelBehavior) {
+        await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: false });
+      }
+    }
+  } catch (err) {
+    console.warn('[Relay Hub open mode failed]', err);
+  }
+}
+
+function normalizeOpenMode(value) {
+  return value === 'sidepanel' ? 'sidepanel' : 'popup';
+}
+
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (!msg) return false;
   if (msg.type !== 'CPA_CHANNEL_FETCH') return false;

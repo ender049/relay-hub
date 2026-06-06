@@ -2,6 +2,7 @@ const frame = document.getElementById('app');
 const shellSideBtn = document.getElementById('shellSideBtn');
 
 const STORE_KEYS = ['apm_s', 'apm_ch', 'apm_tab', 'apm_font', 'relay_theme', 'apm_ar'];
+const OPEN_MODE_KEY = 'relay_open_mode';
 
 function readStore() {
   const data = {};
@@ -16,8 +17,38 @@ function sendStore() {
   frame.contentWindow.postMessage({ type: 'RELAY_STORE_DATA', data: readStore() }, '*');
 }
 
-frame.addEventListener('load', sendStore);
-setTimeout(sendStore, 0);
+function normalizeOpenMode(value) {
+  return value === 'sidepanel' ? 'sidepanel' : 'popup';
+}
+
+async function readOpenMode() {
+  try {
+    const data = await chrome.storage.local.get(OPEN_MODE_KEY);
+    return normalizeOpenMode(data[OPEN_MODE_KEY]);
+  } catch {
+    return normalizeOpenMode(localStorage.getItem(OPEN_MODE_KEY));
+  }
+}
+
+async function writeOpenMode(value) {
+  const mode = normalizeOpenMode(value);
+  localStorage.setItem(OPEN_MODE_KEY, mode);
+  await chrome.storage.local.set({ [OPEN_MODE_KEY]: mode });
+  return mode;
+}
+
+async function sendOpenMode() {
+  const mode = await readOpenMode();
+  frame.contentWindow.postMessage({ type: 'RELAY_OPEN_MODE_DATA', mode }, '*');
+}
+
+function sendInitialData() {
+  sendStore();
+  sendOpenMode();
+}
+
+frame.addEventListener('load', sendInitialData);
+setTimeout(sendInitialData, 0);
 
 async function openSidePanelFromShell() {
   if (!chrome.sidePanel || !chrome.sidePanel.open) throw new Error('当前浏览器不支持侧边栏');
@@ -46,6 +77,15 @@ window.addEventListener('message', async event => {
   }
   if (msg && msg.type === 'RELAY_STORE_SET' && msg.key) {
     localStorage.setItem(msg.key, msg.value ?? '');
+    return;
+  }
+  if (msg && msg.type === 'RELAY_OPEN_MODE_GET') {
+    await sendOpenMode();
+    return;
+  }
+  if (msg && msg.type === 'RELAY_OPEN_MODE_SET') {
+    const mode = await writeOpenMode(msg.mode);
+    frame.contentWindow.postMessage({ type: 'RELAY_OPEN_MODE_DATA', mode }, '*');
     return;
   }
   if (msg && msg.type === 'RELAY_OPEN_SIDEPANEL') {
@@ -90,4 +130,9 @@ window.addEventListener('message', async event => {
 
 window.addEventListener('storage', event => {
   if (STORE_KEYS.includes(event.key)) sendStore();
+  if (event.key === OPEN_MODE_KEY) sendOpenMode();
+});
+
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === 'local' && changes[OPEN_MODE_KEY]) sendOpenMode();
 });
