@@ -101,6 +101,7 @@ CPA 对象表示一个 CLI Proxy API 服务端。
 | 下载凭证文件 | GET | `/v0/management/auth-files/download?name=` |
 | 删除凭证文件 | DELETE | `/v0/management/auth-files?name=` |
 | 使用统计 | GET | `/v0/management/usage` |
+| 完整配置 | GET | `/v0/management/config` |
 | 代理请求 | POST | `/v0/management/api-call` |
 | API Key 列表 | GET | `/v0/management/api-keys` |
 | API Key 更新 | PUT | `/v0/management/api-keys` |
@@ -153,6 +154,7 @@ CPA 和渠道地址都需要先规范化再拼接路径。
 - 主 tab 只有 `CPA` 和 `渠道`。
 - CPA / 渠道卡片保持统一结构：状态点、名称、地址、右侧操作区。
 - CPA 操作区为 `凭证` / `API Key` / `设置` / `更多`。
+- CPA 设置弹窗优先读取 `/v0/management/config` 的真实配置，再用单项设置端点兜底。
 - 渠道操作区为 `密钥` / `充值` / `刷新` / `更多`。
 - `更多` 菜单内放编辑和删除。
 - 表单 placeholder 不应包含真实个人信息。
