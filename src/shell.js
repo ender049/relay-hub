@@ -110,6 +110,17 @@ window.addEventListener('message', async event => {
     frame.contentWindow.postMessage({ type: 'RELAY_COPY_TEXT_RESULT', ok, error }, '*');
     return;
   }
+  if (msg && msg.type === 'RELAY_READ_SITE_TOKENS') {
+    let response;
+    try {
+      response = await chrome.runtime.sendMessage({ type: 'RELAY_READ_SITE_TOKENS' });
+      if (!response) response = { ok: false, error: '扩展后台无响应' };
+    } catch (err) {
+      response = { ok: false, error: err && err.message ? err.message : String(err) };
+    }
+    frame.contentWindow.postMessage({ type: 'RELAY_READ_SITE_TOKENS_RESULT', response }, '*');
+    return;
+  }
   if (!msg || msg.type !== 'CPA_CHANNEL_FETCH' || !msg.id) return;
   let response;
   try {

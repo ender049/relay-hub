@@ -120,7 +120,9 @@ CPA 对象表示一个 CLI Proxy API 服务端。
 - 分组只来自用户可用分组接口。
 - 刷新时优先复用已保存 token 或登录会话。
 - New API 支持系统访问令牌和用户 ID 作为账号密码登录失败后的兜底，主要用于 Turnstile 拦截登录接口的站点。
-- 只有接口返回 `401` 时才清理运行时 token 并重新登录；配置中的 New API 系统访问令牌不自动清理。
+- Sub2API 支持访问令牌和刷新令牌作为账号密码登录失败后的兜底；前后端分离站点应填写 API 域名。
+- Sub2API 保存刷新令牌后，访问令牌缺失、即将过期或接口返回 `401` 时会调用 `/api/v1/auth/refresh` 换新。
+- 只有接口返回 `401` 时才清理运行时 token 并重新登录；配置中的 New API 系统访问令牌和 Sub2API 刷新令牌不自动清理。
 - 手动字段只保留充值入口和充值比例。
 
 New API 用户侧接口：
@@ -132,6 +134,8 @@ New API 用户侧接口：
 
 Sub2API 用户侧接口：
 
+- 登录优先尝试 `/api/v1/auth/login`，仅在 `404` 类旧站点路径不匹配时继续尝试历史路径。
+- 刷新令牌使用 `/api/v1/auth/refresh`。
 - `/api/v1/auth/me`
 - `/api/v1/usage/dashboard/stats`
 - `/api/v1/payment/config`

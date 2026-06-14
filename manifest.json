@@ -3,7 +3,7 @@
   "name": "Relay Hub",
   "version": "0.1.13",
   "description": "Manage CPA credentials and New API/Sub2API upstream channels.",
-  "permissions": ["storage", "sidePanel", "tabs"],
+  "permissions": ["storage", "sidePanel", "tabs", "scripting"],
   "host_permissions": ["<all_urls>"],
   "background": {
     "service_worker": "src/background.js"

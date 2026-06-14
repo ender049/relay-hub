@@ -9,7 +9,7 @@ Relay Hub 会在浏览器本地存储中保存以下数据：
 - CPA 服务端名称、地址和管理密钥。
 - New API / Sub2API 渠道名称、地址、登录账号和密码。
 - New API 系统访问令牌和对应用户 ID。
-- 渠道站点登录后返回的 token。
+- 渠道站点登录后返回的访问令牌和刷新令牌。
 - 当前 tab、主题、自动刷新间隔等界面偏好。
 
 这些本地数据只做简单混淆，不等同于加密。
@@ -27,7 +27,7 @@ Relay Hub 只会向用户自己配置的服务发起请求：
 
 Relay Hub 申请 `<all_urls>` host permission，是为了让扩展后台访问用户配置的 CPA 和渠道站点，绕过普通网页环境下的 CORS 限制。
 
-Relay Hub 不向网页注入 content script。
+Relay Hub 申请 `scripting` permission，是为了在用户主动点击读取令牌时，从当前已登录的 xtokenmirror 标签页读取 `auth_token` 和 `refresh_token`。
 
 ## 使用建议
 

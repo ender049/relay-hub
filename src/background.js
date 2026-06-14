@@ -32,10 +32,39 @@ function normalizeOpenMode(value) {
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (!msg) return false;
-  if (msg.type !== 'CPA_CHANNEL_FETCH') return false;
-  handleExtensionFetch(msg.payload || {}).then(sendResponse);
-  return true;
+  if (msg.type === 'CPA_CHANNEL_FETCH') {
+    handleExtensionFetch(msg.payload || {}).then(sendResponse);
+    return true;
+  }
+  if (msg.type === 'RELAY_READ_SITE_TOKENS') {
+    readSiteTokens().then(sendResponse);
+    return true;
+  }
+  return false;
 });
+
+async function readSiteTokens() {
+  try {
+    if (!chrome.scripting || !chrome.scripting.executeScript) throw new Error('当前浏览器不支持读取页面令牌');
+    const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+    const tab = tabs[0];
+    if (!tab || !tab.id || !tab.url) throw new Error('请先切换到已登录的 xtokenmirror 标签页');
+    const url = new URL(tab.url);
+    if (!/(^|\.)xtokenmirror\.(com|cn)$/i.test(url.hostname)) throw new Error('请先切换到已登录的 xtokenmirror 标签页');
+    const [result] = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: () => ({
+        auth_token: localStorage.getItem('auth_token') || '',
+        access_token: localStorage.getItem('access_token') || '',
+        refresh_token: localStorage.getItem('refresh_token') || '',
+        token_expires_at: localStorage.getItem('token_expires_at') || ''
+      })
+    });
+    return { ok: true, ...(result && result.result ? result.result : {}) };
+  } catch (err) {
+    return { ok: false, error: err && err.message ? err.message : String(err) };
+  }
+}
 
 async function handleExtensionFetch(payload) {
   try {
