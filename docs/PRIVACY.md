@@ -27,7 +27,7 @@ Relay Hub 只会向用户自己配置的服务发起请求：
 
 Relay Hub 申请 `<all_urls>` host permission，是为了让扩展后台访问用户配置的 CPA 和渠道站点，绕过普通网页环境下的 CORS 限制。
 
-Relay Hub 申请 `scripting` permission，是为了在用户主动点击读取令牌时，从当前已登录的 xtokenmirror 标签页读取 `auth_token` 和 `refresh_token`。
+Relay Hub 申请 `scripting` permission，是为了在用户主动点击读取令牌时，从当前已登录的渠道标签页读取 `auth_token` 和 `refresh_token`。
 
 ## 使用建议
 

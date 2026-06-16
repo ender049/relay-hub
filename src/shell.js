@@ -113,7 +113,7 @@ window.addEventListener('message', async event => {
   if (msg && msg.type === 'RELAY_READ_SITE_TOKENS') {
     let response;
     try {
-      response = await chrome.runtime.sendMessage({ type: 'RELAY_READ_SITE_TOKENS' });
+      response = await chrome.runtime.sendMessage({ type: 'RELAY_READ_SITE_TOKENS', siteUrl: msg.siteUrl });
       if (!response) response = { ok: false, error: '扩展后台无响应' };
     } catch (err) {
       response = { ok: false, error: err && err.message ? err.message : String(err) };

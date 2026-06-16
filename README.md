@@ -63,7 +63,7 @@ CPA 地址支持直接填写主机、端口或完整 URL。面板会自动整理
 
 渠道页面用于查看 New API / Sub2API 上游账号。
 
-- `新增渠道`：填写名称、系统类型和站点地址。New API 支持账号密码优先同步，也可配置系统访问令牌和用户 ID 作为 Turnstile 兜底；Sub2API 支持账号密码优先同步，也可读取已登录站点的访问令牌和刷新令牌作为 Turnstile 兜底，并在过期时自动刷新。前后端分离站点请填写 API 域名，例如 `https://api.xtokenmirror.com`。
+- `新增渠道`：填写名称、系统类型和站点地址。New API 支持账号密码优先同步，也可配置系统访问令牌和用户 ID 作为 Turnstile 兜底；Sub2API 支持账号密码优先同步，也可读取已登录站点的访问令牌和刷新令牌作为 Turnstile 兜底，并在过期时自动刷新。前后端分离站点请填写该站点的 API 域名，例如 `https://api.example.com`。
 - `密钥`：查看和管理渠道侧的用户 API Key。
 - `充值`：打开渠道充值入口。
 - `刷新`：重新同步当前渠道数据。
@@ -78,7 +78,7 @@ CPA 地址支持直接填写主机、端口或完整 URL。面板会自动整理
 - `storage`：保存本地配置。
 - `sidePanel`：打开浏览器侧边栏。
 - `tabs`：定位当前标签页以打开侧边栏，或从已登录渠道页读取本地令牌。
-- `scripting`：在用户当前打开的 xtokenmirror 标签页执行一次性脚本，读取 `auth_token` 和 `refresh_token`。
+- `scripting`：在用户当前打开的已登录渠道标签页执行一次性脚本，读取 `auth_token` 和 `refresh_token`。
 - `<all_urls>`：由扩展后台请求用户配置的 CPA / New API / Sub2API 地址，绕过普通网页的 CORS 限制。
 
 Relay Hub 不注入网页内容，不做遥测，不把配置上传到第三方服务。请求只会发往你自己配置的 CPA 服务端和渠道站点。

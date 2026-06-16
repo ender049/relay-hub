@@ -37,20 +37,25 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return true;
   }
   if (msg.type === 'RELAY_READ_SITE_TOKENS') {
-    readSiteTokens().then(sendResponse);
+    readSiteTokens(msg.siteUrl).then(sendResponse);
     return true;
   }
   return false;
 });
 
-async function readSiteTokens() {
+async function readSiteTokens(siteUrl) {
   try {
     if (!chrome.scripting || !chrome.scripting.executeScript) throw new Error('当前浏览器不支持读取页面令牌');
+    const expectedUrl = parseHttpUrl(siteUrl);
+    if (!expectedUrl) throw new Error('请先填写 Sub2API 站点地址');
     const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
     const tab = tabs[0];
-    if (!tab || !tab.id || !tab.url) throw new Error('请先切换到已登录的 xtokenmirror 标签页');
-    const url = new URL(tab.url);
-    if (!/(^|\.)xtokenmirror\.(com|cn)$/i.test(url.hostname)) throw new Error('请先切换到已登录的 xtokenmirror 标签页');
+    if (!tab || !tab.id || !tab.url) throw new Error('请先切换到已登录的 Sub2API 站点标签页');
+    const currentUrl = parseHttpUrl(tab.url);
+    if (!currentUrl) throw new Error('请先切换到已登录的 Sub2API 站点标签页');
+    if (!siteHostsMatch(currentUrl.hostname, expectedUrl.hostname)) {
+      throw new Error(`当前标签页域名 ${currentUrl.hostname} 与渠道站点 ${expectedUrl.hostname} 不匹配`);
+    }
     const [result] = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       func: () => ({
@@ -60,10 +65,43 @@ async function readSiteTokens() {
         token_expires_at: localStorage.getItem('token_expires_at') || ''
       })
     });
-    return { ok: true, ...(result && result.result ? result.result : {}) };
+    return { ok: true, siteUrl: expectedUrl.href, pageUrl: currentUrl.href, ...(result && result.result ? result.result : {}) };
   } catch (err) {
     return { ok: false, error: err && err.message ? err.message : String(err) };
   }
+}
+
+function parseHttpUrl(value) {
+  try {
+    const url = new URL(String(value || ''));
+    return /^https?:$/i.test(url.protocol) ? url : null;
+  } catch {
+    return null;
+  }
+}
+
+function siteHostsMatch(currentHost, expectedHost) {
+  const current = normalizeHost(currentHost);
+  const expected = normalizeHost(expectedHost);
+  if (!current || !expected) return false;
+  if (current === expected) return true;
+  if (current.endsWith('.' + expected) || expected.endsWith('.' + current)) return true;
+  return registrableHost(current) === registrableHost(expected);
+}
+
+function normalizeHost(host) {
+  return String(host || '').trim().toLowerCase().replace(/\.$/, '');
+}
+
+function registrableHost(host) {
+  const labels = normalizeHost(host).split('.').filter(Boolean);
+  if (labels.length <= 2) return labels.join('.');
+  const lastTwo = labels.slice(-2).join('.');
+  const multiPartSuffixes = new Set([
+    'com.cn', 'net.cn', 'org.cn', 'gov.cn', 'com.hk', 'com.tw',
+    'co.uk', 'org.uk', 'com.au', 'net.au', 'co.jp', 'co.kr', 'com.sg'
+  ]);
+  return multiPartSuffixes.has(lastTwo) ? labels.slice(-3).join('.') : lastTwo;
 }
 
 async function handleExtensionFetch(payload) {
