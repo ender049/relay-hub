@@ -131,6 +131,7 @@ New API 用户侧接口：
 - `/api/user/self/groups`
 - `/api/data/self`
 - `/api/user/topup/info`
+- `POST /api/user/topup`，请求体 `{ key }`，用于兑换充值码。
 
 Sub2API 用户侧接口：
 
@@ -140,6 +141,7 @@ Sub2API 用户侧接口：
 - `/api/v1/usage/dashboard/stats`
 - `/api/v1/payment/config`
 - `/api/v1/groups/available`
+- `POST /api/v1/redeem`，请求体 `{ code }`，用于兑换充值码。
 
 ## URL 处理
 
@@ -159,8 +161,8 @@ CPA 和渠道地址都需要先规范化再拼接路径。
 - CPA / 渠道卡片保持统一结构：状态点、名称、地址、右侧操作区。
 - CPA 操作区为 `凭证` / `API Key` / `设置` / `更多`。
 - CPA 设置弹窗优先读取 `/v0/management/config` 的真实配置，再用单项设置端点兜底。
-- 渠道操作区为 `密钥` / `充值` / `刷新` / `更多`。
-- `更多` 菜单内放编辑和删除。
+- 渠道操作区固定两行：第一行 `手动刷新` / `自动刷新`，第二行 `密钥` / `更多`。
+- 渠道 `更多` 菜单内放充值、兑换、编辑和删除。
 - 表单 placeholder 不应包含真实个人信息。
 
 ## 开发命令
