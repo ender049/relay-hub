@@ -296,7 +296,7 @@ function renderNewApiMetrics(d,topup){const s=d.status||{},rr=d.rechargeRatioMan
 function renderSub2Metrics(d,topup){const rr=d.rechargeRatioManual||fmtRatio(d.rechargeRatio);return renderChannelMetricRows(fmtMoney(d.balance),rr,fmtMoney(d.todayCost),fmtMoney(d.totalCost))}
 async function refreshChannels(){await Promise.allSettled(channels.map(c=>refreshChannel(c.id)));renderData()}
 async function refreshChannel(id){const c=channels.find(x=>x.id===id);if(!c||chRefreshing.has(id))return;chRefreshing.add(id);renderData();try{await connectChannel(c)}finally{chRefreshing.delete(id);renderData()}}
-function renderChAutoRefreshBtn(c){const on=chAutoEnabled(c),label=on?'自动刷新已开启':'自动刷新已关闭';return`<button class="b ${on?'bp':'bs'} icon-btn" onclick="toggleChAutoRefresh('${c.id}')" title="${label}" aria-label="${label}">${icon('i-refresh')}</button>`}
+function renderChAutoRefreshBtn(c){const on=chAutoEnabled(c),label=on?'自动刷新已开启':'自动刷新已关闭';return`<button class="b ${on?'bp':'bs'} icon-btn icon-only keep-icon" onclick="toggleChAutoRefresh(${jsArg(c.id)})" title="${label}" aria-label="${label}">${icon(on?'i-play':'i-ban')}</button>`}
 function toggleChAutoRefresh(id){const c=channels.find(x=>x.id===id);if(!c)return;c.autoRefresh=!chAutoEnabled(c);persistChannels();showToast(c.autoRefresh?'自动刷新已开启':'自动刷新已关闭');renderCur()}
 function hideChModal(){if(chSaving)return;document.getElementById('chModal').classList.add('hidden');editChId=null;setChSaveBusy(false)}
 function setChSaveBusy(v){chSaving=v;const b=document.getElementById('chSaveBtn');if(b){b.disabled=v;b.innerHTML=v?'<span class="ld" style="width:14px;height:14px;border-width:2px"></span>':icon('i-check');b.dataset.iconized='保存';b.classList.add('icon-only','icon-btn')}}
