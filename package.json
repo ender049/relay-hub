@@ -1,0 +1,24 @@
+{
+  "name": "relay-hub",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Relay Hub browser extension and desktop client.",
+  "main": "client/electron/main.js",
+  "scripts": {
+    "client": "electron .",
+    "client:tauri": "node scripts/run-tauri.js dev",
+    "build:tauri": "node scripts/run-tauri.js build && node scripts/collect-release.js",
+    "build:tauri:exe": "node scripts/run-tauri.js build --no-bundle && node scripts/collect-release.js",
+    "build:tauri:linux": "node scripts/run-tauri.js build --bundles deb,rpm && node scripts/collect-release.js",
+    "build:tauri:windows-gnu-exe": "node scripts/run-rustup.js target add x86_64-pc-windows-gnu && node scripts/run-tauri.js build --target x86_64-pc-windows-gnu --no-bundle && node scripts/collect-release.js",
+    "build:tauri:windows-msvc-exe": "node scripts/run-rustup.js target add x86_64-pc-windows-msvc && node scripts/run-tauri.js build --target x86_64-pc-windows-msvc --no-bundle && node scripts/collect-release.js",
+    "check": "node --check src/host.js src/app.js src/background.js src/shell.js client/electron/main.js client/electron/preload.js client/electron/renderer.js client/tauri/tauri-shell.js scripts/prepare-tauri.js scripts/collect-release.js scripts/run-tauri.js scripts/run-rustup.js",
+    "package:extension": "python3 scripts/package-extension.py && node scripts/collect-release.js",
+    "prepare:tauri": "node scripts/prepare-tauri.js",
+    "release:collect": "node scripts/collect-release.js"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.11.4",
+    "electron": "^31.0.0"
+  }
+}

@@ -110,6 +110,10 @@ window.addEventListener('message', async event => {
     frame.contentWindow.postMessage({ type: 'RELAY_COPY_TEXT_RESULT', ok, error }, '*');
     return;
   }
+  if (msg && msg.type === 'RELAY_OPEN_EXTERNAL') {
+    window.open(String(msg.url || ''), '_blank', 'noopener,noreferrer');
+    return;
+  }
   if (msg && msg.type === 'RELAY_READ_SITE_TOKENS') {
     let response;
     try {

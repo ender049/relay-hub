@@ -1,6 +1,6 @@
 # Relay Hub
 
-轻量的 Chrome / Edge 浏览器扩展，用于统一管理多个 CLI Proxy API (CPA) 服务端，并查看 New API / Sub2API 上游渠道账号信息。
+轻量的 Chrome / Edge 浏览器扩展，用于统一管理多个 CLI Proxy API (CPA) 服务端，并查看 New API / Sub2API 上游渠道账号信息。项目同时开始提供桌面客户端骨架，复用同一套主界面。
 
 ## 背景
 
@@ -24,6 +24,7 @@ Relay Hub 不是 All API Hub 的替代品，而是一个偏个人自用、轻量
 - 管理 New API / Sub2API 渠道账号。
 - 自动同步渠道余额、今日消费、累计消费、充值比例和可用分组。
 - 支持 popup 和浏览器侧边栏，两者共用同一套界面。
+- 提供 Electron / Tauri 桌面客户端骨架，复用主 UI 和业务逻辑。
 - 支持浅色 / 深色主题和自动刷新。
 
 ## 安装
@@ -71,6 +72,47 @@ CPA 地址支持直接填写主机、端口或完整 URL。面板会自动整理
 
 渠道余额、今日消费、累计消费和分组信息只来自接口同步，不提供手动填写，避免数据失真。手动字段只用于补充充值入口和充值比例。
 
+## 桌面客户端
+
+桌面客户端目前有两个宿主实现：
+
+- `client/electron/`：Electron 版骨架，Chromium 行为一致，当前保留登录接管接口占位。
+- `client/tauri/`：Tauri 版，包体更轻，已接入 New API / Sub2API + Turnstile 登录接管流程。
+
+两者都加载同一套 `pages/index.html` / `src/host.js` / `src/app.js`，宿主层分别提供本地存储、网络请求、剪贴板和外链打开能力。
+
+客户端认证策略设计为：先尝试用户名密码自动登录；遇到 Turnstile 或登录接口拦截时，Tauri 打开独立登录窗口并代填已保存的用户名密码，用户完成验证和登录后点击“读取令牌”回填配置。
+
+运行方式：
+
+```bash
+npm install
+npm run client        # Electron
+npm run client:tauri  # Tauri
+```
+
+打包 Tauri：
+
+```bash
+npm run build:tauri
+```
+
+Linux 仅打 deb/rpm：
+
+```bash
+npm run build:tauri:linux
+```
+
+Windows 单文件 exe 用 GitHub Actions 的 `Build Windows Client` workflow 生成，artifact 名称为 `relay-hub-windows`，文件名为 `relay-hub-tauri-windows-x86_64-single.exe`。Linux 下 GNU 交叉编译会输出 `relay-hub-tauri-windows-x86_64.exe`。
+
+可测试产物统一放在：
+
+```text
+release/
+```
+
+详细说明见 [docs/CLIENT.md](docs/CLIENT.md) 和 [docs/TAURI.md](docs/TAURI.md)。
+
 ## 权限说明
 
 扩展使用以下权限：
@@ -97,10 +139,14 @@ Relay Hub 不注入网页内容，不做遥测，不把配置上传到第三方�
 ├── manifest.json          # Chrome / Edge MV3 扩展配置
 ├── src/
 │   ├── background.js      # 扩展后台，请求转发和跨域访问
-│   ├── shell.js           # 外壳逻辑，存储同步、复制、请求桥接
+│   ├── shell.js           # 扩展外壳逻辑，存储同步、复制、请求桥接
+│   ├── host.js            # 共享宿主适配接口
 │   └── app.js             # 主要状态、渲染、请求和交互逻辑
 ├── scripts/
 │   └── package-extension.py # 官方扩展打包脚本
+├── client/
+│   ├── electron/        # Electron 桌面客户端宿主层
+│   └── tauri/           # Tauri 桌面客户端宿主层
 ├── pages/
 │   ├── popup.html         # popup 外壳
 │   ├── sidepanel.html     # side panel 外壳
@@ -108,21 +154,21 @@ Relay Hub 不注入网页内容，不做遥测，不把配置上传到第三方�
 ├── assets/
 │   └── relayhub.png       # 扩展图标
 ├── docs/
+│   ├── CLIENT.md          # 桌面客户端说明
 │   ├── DEVELOPMENT.md     # 开发说明
-│   └── PRIVACY.md         # 隐私说明
+│   ├── PRIVACY.md         # 隐私说明
+│   └── TAURI.md           # Tauri 客户端说明
 └── LICENSE
 ```
 
 ## 开发
 
-项目是纯前端 MV3 扩展，无构建步骤。
+浏览器扩展无构建步骤。桌面客户端需要安装 Electron 依赖。
 
 验证 JS 语法：
 
 ```bash
-node --check src/app.js
-node --check src/background.js
-node --check src/shell.js
+npm run check
 ```
 
 官方打包命令：
@@ -131,7 +177,7 @@ node --check src/shell.js
 python3 scripts/package-extension.py
 ```
 
-产物为 `dist/relay-hub-extension.zip`。压缩包必须保留 `pages/`、`src/`、`assets/` 目录结构，不要使用 `python3 -m zipfile -c ...` 手动打包。
+扩展产物为 `release/relay-hub-extension.zip`。压缩包必须保留 `pages/`、`src/`、`assets/` 目录结构，不要使用 `python3 -m zipfile -c ...` 手动打包。
 
 更多开发细节见 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)。
 

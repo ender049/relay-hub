@@ -4,7 +4,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-OUTPUT = ROOT / 'dist' / 'relay-hub-extension.zip'
+OUTPUT = ROOT / 'release' / 'relay-hub-extension.zip'
 FILES = [
     'manifest.json',
     'src/background.js',
@@ -12,6 +12,7 @@ FILES = [
     'pages/sidepanel.html',
     'src/shell.js',
     'pages/index.html',
+    'src/host.js',
     'src/app.js',
     'assets/relayhub.png',
 ]

@@ -1,0 +1,51 @@
+name: Build Windows Client
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'client/tauri/**'
+      - 'pages/**'
+      - 'src/**'
+      - 'assets/**'
+      - 'scripts/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.github/workflows/build-windows.yml'
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check JavaScript
+        run: npm run check
+
+      - name: Build Windows Tauri single executable
+        run: npm run build:tauri:windows-msvc-exe
+
+      - name: List release artifacts
+        shell: pwsh
+        run: Get-ChildItem release | Format-Table Name,Length
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: relay-hub-windows
+          path: release/relay-hub-tauri-windows-x86_64-single.exe
+          if-no-files-found: error

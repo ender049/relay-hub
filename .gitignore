@@ -4,13 +4,19 @@
 *.pem
 *.xpi
 dist/
+release/
 build/
+node_modules/
+client/tauri/src-tauri/target/
+client/tauri/src-tauri/gen/
 
 # Local browser/test artifacts
 .playwright-mcp/
 playwright-report/
 test-results/
 *.log
+__pycache__/
+*.pyc
 
 # Local screenshots may contain private account data
 relay-hub-*-ui.png

@@ -1,0 +1,33 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Relay Hub",
+  "version": "0.1.0",
+  "identifier": "io.github.ender049.relayhub",
+  "build": {
+    "beforeDevCommand": "node ../../scripts/prepare-tauri.js",
+    "beforeBuildCommand": "node ../../scripts/prepare-tauri.js",
+    "frontendDist": "../../../dist/tauri-ui"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "Relay Hub",
+        "width": 420,
+        "height": 720,
+        "minWidth": 360,
+        "minHeight": 520,
+        "resizable": true,
+        "fullscreen": false,
+        "backgroundColor": "#0f172a"
+      }
+    ],
+    "security": {
+      "capabilities": ["main-capability"]
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all"
+  }
+}

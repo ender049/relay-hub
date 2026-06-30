@@ -11,11 +11,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install dependencies
+        run: npm ci
+
       - name: Check JavaScript syntax
-        run: |
-          node --check src/app.js
-          node --check src/background.js
-          node --check src/shell.js
+        run: npm run check
 
       - name: Build extension zip
-        run: python3 scripts/package-extension.py
+        run: npm run package:extension

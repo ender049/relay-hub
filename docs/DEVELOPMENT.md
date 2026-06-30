@@ -18,10 +18,14 @@ manifest.json
 pages/popup.html / pages/sidepanel.html
 └── iframe sandbox app: pages/index.html
 
+src/host.js
+└── 共享宿主适配接口，供 src/app.js 调用存储、网络、剪贴板、外链和宿主能力
+
 src/shell.js
+├── 实现扩展宿主消息协议
 ├── 向 sandbox app 同步 localStorage 配置
 ├── 接收 app 的存储写入请求
-├── 接收 app 的复制请求并调用 Clipboard API
+├── 接收 app 的复制 / 外链请求
 └── 将 app 的网络请求转交 src/background.js
 
 src/background.js
@@ -36,19 +40,24 @@ src/background.js
 | `src/background.js` | 后台请求转发，区分 CPA 请求和渠道请求 |
 | `pages/popup.html` | 扩展 popup 外壳 |
 | `pages/sidepanel.html` | 浏览器侧边栏外壳 |
-| `src/shell.js` | 外壳逻辑，负责存储同步、复制桥接、请求桥接 |
+| `src/shell.js` | 扩展外壳逻辑，负责存储同步、复制桥接、请求桥接 |
+| `src/host.js` | 共享宿主适配接口，屏蔽扩展与客户端差异 |
 | `pages/index.html` | 主 UI、CSS、模态框和 SVG 图标 |
 | `src/app.js` | 状态、渲染、CPA / 渠道请求、自动刷新和交互逻辑 |
 | `assets/relayhub.png` | 扩展图标 |
 | `scripts/package-extension.py` | 官方扩展打包脚本，保留 zip 内目录结构 |
+| `client/electron/` | Electron 桌面客户端宿主层，复用主 UI，提供桌面端存储、网络和剪贴板能力 |
+| `client/tauri/` | Tauri 桌面客户端宿主层，复用主 UI，提供轻量客户端测试路径 |
+| `docs/CLIENT.md` | 桌面客户端结构、运行方式和渠道认证策略 |
+| `docs/TAURI.md` | Tauri 客户端运行、打包和系统依赖说明 |
 
 ## 数据流
 
 ### 存储
 
-配置保存在外壳页面的 `localStorage` 中。
+扩展配置保存在外壳页面的 `localStorage` 中。Electron 配置保存在 `userData/store.json` 中。Tauri 配置保存在 `%APPDATA%/io.github.ender049.relayhub/store.json` 中。
 
-`src/shell.js` 会把以下 key 同步给 sandbox app：
+`src/app.js` 只通过 `src/host.js` 读取和写入配置。扩展环境下，`src/shell.js` 会把以下 key 同步给 sandbox app：
 
 - `apm_s`：CPA 服务端配置。
 - `apm_ch`：渠道配置。
@@ -61,10 +70,16 @@ sandbox app 不能直接作为可信配置源。启动时以 shell 同步的数�
 
 ### 网络请求
 
-普通网页直接请求渠道站点会遇到 CORS 限制，所以扩展使用消息桥接：
+普通网页直接请求渠道站点会遇到 CORS 限制，所以扩展使用宿主桥接：
 
 ```text
-src/app.js -> postMessage -> src/shell.js -> chrome.runtime.sendMessage -> src/background.js -> fetch
+src/app.js -> src/host.js -> src/shell.js -> chrome.runtime.sendMessage -> src/background.js -> fetch
+```
+
+桌面客户端使用相同的 app/host 调用点：
+
+```text
+src/app.js -> src/host.js -> client/electron/renderer.js -> Electron main -> fetch
 ```
 
 CPA 请求和渠道请求都会经过 background，但处理策略不同：
@@ -74,10 +89,10 @@ CPA 请求和渠道请求都会经过 background，但处理策略不同：
 
 ### 复制
 
-`pages/index.html` 是 sandbox 页面，不能可靠直接调用 `navigator.clipboard.writeText()`。复制操作统一由 app 发消息给 shell，再由 shell 调用 Clipboard API。
+`pages/index.html` 是 sandbox 页面，不能可靠直接调用 `navigator.clipboard.writeText()`。复制操作统一由 host adapter 转给宿主层。
 
 ```text
-src/app.js -> RELAY_COPY_TEXT -> src/shell.js -> Clipboard API -> RELAY_COPY_TEXT_RESULT
+src/app.js -> src/host.js -> 宿主 shell -> Clipboard API
 ```
 
 ## CPA 模块
@@ -165,14 +180,53 @@ CPA 和渠道地址都需要先规范化再拼接路径。
 - 渠道 `更多` 菜单内放充值、兑换、编辑和删除。
 - 表单 placeholder 不应包含真实个人信息。
 
+## 客户端形态
+
+桌面客户端加载同一套 `pages/index.html` / `src/host.js` / `src/app.js`。客户端宿主层通过与扩展 shell 相同的消息协议提供存储、网络请求、剪贴板和外链能力。详细设计见 `docs/CLIENT.md`。
+
+当前有两个客户端宿主：
+
+- `client/electron/`：Electron 版骨架，当前保留登录接管接口占位。
+- `client/tauri/`：Tauri 版，包体更轻，已接入 New API / Sub2API + Turnstile 登录接管流程。
+
+客户端认证策略是先尝试用户名密码自动登录；遇到 Turnstile 或登录接口拦截时，Tauri 打开内置登录窗口并代填当前渠道的用户名密码，用户完成真实登录后点击“读取令牌”回填配置。Sub2API 回填访问/刷新令牌，New API 回填访问令牌并尽量补齐用户 ID。
+
+运行客户端：
+
+```bash
+npm install
+npm run client        # Electron
+npm run client:tauri  # Tauri
+```
+
+打包 Tauri：
+
+```bash
+npm run build:tauri
+```
+
+Linux 仅打 deb/rpm：
+
+```bash
+npm run build:tauri:linux
+```
+
+可测试产物统一复制到根目录 `release/`。Windows 单文件 exe 由 GitHub Actions 的 `Build Windows Client` workflow 在 MSVC 环境生成；Linux 交叉编译 Windows GNU 产物需要 MinGW，运行时需要把 `WebView2Loader.dll` 放在 exe 同目录。Linux Tauri 打包需要 Rust、Cargo、pkg-config 和 WebKitGTK 开发包，见 `docs/TAURI.md`。
+
 ## 开发命令
 
 验证语法：
 
 ```bash
+npm run check
+
+# 或逐个检查
 node --check src/app.js
 node --check src/background.js
 node --check src/shell.js
+node --check client/electron/main.js
+node --check client/electron/preload.js
+node --check client/electron/renderer.js
 ```
 
 官方打包命令：
@@ -181,7 +235,7 @@ node --check src/shell.js
 python3 scripts/package-extension.py
 ```
 
-产物为 `dist/relay-hub-extension.zip`。压缩包内必须包含 `manifest.json`、`pages/index.html`、`src/app.js`、`assets/relayhub.png` 等原始相对路径。不要使用 `python3 -m zipfile -c ...` 手动打包，因为它可能压平目录结构，导致扩展重新加载后仍不是最新代码。
+扩展产物为 `release/relay-hub-extension.zip`。压缩包内必须包含 `manifest.json`、`pages/index.html`、`src/app.js`、`assets/relayhub.png` 等原始相对路径。不要使用 `python3 -m zipfile -c ...` 手动打包，因为它可能压平目录结构，导致扩展重新加载后仍不是最新代码。
 
 本地静态预览仅用于查看 UI，渠道跨域和扩展权限相关能力需要在浏览器扩展环境中测试。
 
