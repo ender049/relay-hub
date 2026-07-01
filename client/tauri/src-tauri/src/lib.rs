@@ -39,6 +39,8 @@ struct FetchPayload {
     site_url: Option<String>,
     #[serde(rename = "siteType")]
     site_type: Option<String>,
+    username: Option<String>,
+    password: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -704,24 +706,102 @@ async fn do_browser_fetch(app: &AppHandle, url: &Url, payload: FetchPayload) -> 
     }
     let site_type = payload.site_type.as_deref().unwrap_or("channel");
     let window = ensure_login_window(app, false)?;
+    ensure_browser_fetch_site(
+        &window,
+        site_url,
+        payload.site_type.as_deref(),
+        site_type,
+        payload.username.as_deref().unwrap_or_default(),
+        payload.password.as_deref().unwrap_or_default(),
+    ).await?;
+
+    let mut response = run_browser_fetch(&window, &payload).await?;
+    if is_cloudflare_challenge_response(&response) {
+        prepare_browser_session(&window, site_url, payload.site_type.as_deref(), payload.username.as_deref().unwrap_or_default(), payload.password.as_deref().unwrap_or_default(), false).await?;
+        response = run_browser_fetch(&window, &payload).await?;
+        if is_cloudflare_challenge_response(&response) {
+            show_login_window_for_revalidation(&window);
+            return Ok(browser_session_expired_response(&expected));
+        }
+    }
+    Ok(response)
+}
+
+async fn ensure_browser_fetch_site(window: &tauri::WebviewWindow, site_url: &str, site_type: Option<&str>, label: &str, username: &str, password: &str) -> Result<(), String> {
+    let expected = Url::parse(site_url).map_err(|_| "浏览器请求模式缺少有效的渠道站点地址".to_string())?;
     let mut current = window.url().map_err(|err| err.to_string())?;
     if !site_hosts_match(current.host_str().unwrap_or_default(), expected.host_str().unwrap_or_default()) {
-        let login = login_url(site_url, payload.site_type.as_deref())?;
-        window.navigate(login).map_err(|err| err.to_string())?;
-        sleep_async(Duration::from_millis(1200)).await?;
+        prepare_browser_session(window, site_url, site_type, username, password, false).await?;
         current = window.url().map_err(|err| err.to_string())?;
     }
     if !site_hosts_match(current.host_str().unwrap_or_default(), expected.host_str().unwrap_or_default()) {
-        return Err(format!("{site_type} 浏览器请求模式需要打开登录页并完成登录"));
+        return Err(format!("{label} 浏览器请求模式需要打开登录页并完成登录"));
     }
+    Ok(())
+}
 
+async fn prepare_browser_session(window: &tauri::WebviewWindow, site_url: &str, site_type: Option<&str>, username: &str, password: &str, visible: bool) -> Result<(), String> {
+    if visible {
+        show_login_window_for_revalidation(window);
+    }
+    let login = login_url(site_url, site_type)?;
+    window.navigate(login.clone()).map_err(|err| err.to_string())?;
+    sleep_async(Duration::from_millis(800)).await?;
+    wait_for_window_host(window, &login, Duration::from_secs(12)).await?;
+    let autofill = if !username.is_empty() || !password.is_empty() {
+        Some(autofill_script(username, password))
+    } else {
+        None
+    };
+    if let Some(script) = &autofill {
+        let _ = window.eval(script.clone());
+    }
+    wait_for_cloudflare_challenge_to_settle(window, Duration::from_secs(14)).await?;
+    if let Some(script) = autofill {
+        let _ = window.eval(script);
+    }
+    Ok(())
+}
+
+async fn wait_for_window_host(window: &tauri::WebviewWindow, expected: &Url, timeout: Duration) -> Result<(), String> {
+    let started = Instant::now();
+    while started.elapsed() < timeout {
+        if let Ok(current) = window.url() {
+            if site_hosts_match(current.host_str().unwrap_or_default(), expected.host_str().unwrap_or_default()) {
+                return Ok(());
+            }
+        }
+        sleep_async(Duration::from_millis(300)).await?;
+    }
+    Ok(())
+}
+
+async fn wait_for_cloudflare_challenge_to_settle(window: &tauri::WebviewWindow, timeout: Duration) -> Result<(), String> {
+    let started = Instant::now();
+    while started.elapsed() < timeout {
+        sleep_async(Duration::from_millis(600)).await?;
+        match eval_with_callback(window, cloudflare_challenge_active_script(), Duration::from_secs(3)).await {
+            Ok(raw) if raw.trim() == "false" => return Ok(()),
+            Ok(_) | Err(_) => {}
+        }
+    }
+    Ok(())
+}
+
+fn show_login_window_for_revalidation(window: &tauri::WebviewWindow) {
+    let _ = window.show();
+    let _ = window.unminimize();
+    let _ = window.set_focus();
+}
+
+async fn run_browser_fetch(window: &tauri::WebviewWindow, payload: &FetchPayload) -> Result<FetchResponse, String> {
     let request_id = format!("relay_fetch_{}", BROWSER_FETCH_SEQ.fetch_add(1, Ordering::Relaxed));
-    window.eval(browser_fetch_start_script(&payload, &request_id)?).map_err(|err| err.to_string())?;
+    window.eval(browser_fetch_start_script(payload, &request_id)?).map_err(|err| err.to_string())?;
 
     let started = Instant::now();
     while started.elapsed() < Duration::from_secs(30) {
         sleep_async(Duration::from_millis(200)).await?;
-        let raw = eval_with_callback(&window, browser_fetch_poll_script(&request_id)?, Duration::from_secs(5)).await?;
+        let raw = eval_with_callback(window, browser_fetch_poll_script(&request_id)?, Duration::from_secs(5)).await?;
         let value: Value = serde_json::from_str(&raw).map_err(|err| err.to_string())?;
         if !value.is_null() {
             return parse_browser_fetch_response(&raw);
@@ -894,6 +974,64 @@ fn browser_fetch_cleanup_script(request_id: &str) -> Result<String, String> {
   const store = window.__relayHubFetchResults || {{}};
   delete store[{id}];
 }})()"#))
+}
+
+fn cloudflare_challenge_active_script() -> String {
+    r#"(() => {
+  if (document.readyState === 'loading') return true;
+  const root = document.documentElement;
+  const text = `${document.title || ''}\n${document.body ? document.body.innerText : ''}\n${root ? root.innerHTML.slice(0, 20000) : ''}`;
+  return /(just a moment|verify you are human|verifying you are human|checking your browser|managed challenge|challenge-platform|cdn-cgi\/challenge-platform|__cf_chl|cf-browser-verification|cloudflare ray id)/i.test(text);
+})()"#.to_string()
+}
+
+fn header_text(headers: &Map<String, Value>, name: &str) -> String {
+    headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .and_then(|(_, value)| value.as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn is_cloudflare_challenge_response(response: &FetchResponse) -> bool {
+    if response.error.as_deref().unwrap_or_default().contains("BROWSER_SESSION_REVALIDATION_REQUIRED") {
+        return true;
+    }
+    if header_text(&response.headers, "cf-mitigated").to_ascii_lowercase().contains("challenge") {
+        return true;
+    }
+    let status = response.status;
+    if !matches!(status, 403 | 429 | 503) {
+        return false;
+    }
+    let body_lower = response.body.to_ascii_lowercase();
+    let content_type = header_text(&response.headers, "content-type").to_ascii_lowercase();
+    let html = content_type.contains("text/html") || body_lower.contains("<html");
+    html && [
+        "just a moment",
+        "verify you are human",
+        "verifying you are human",
+        "checking your browser",
+        "managed challenge",
+        "challenge-platform",
+        "cdn-cgi/challenge-platform",
+        "__cf_chl",
+        "cf-chl",
+        "cf-turnstile",
+        "cf-browser-verification",
+        "cloudflare ray id",
+    ].iter().any(|marker| body_lower.contains(marker))
+}
+
+fn browser_session_expired_response(expected: &Url) -> FetchResponse {
+    FetchResponse {
+        ok: false,
+        status: 0,
+        headers: Map::new(),
+        body: String::new(),
+        error: Some(format!("BROWSER_SESSION_REVALIDATION_REQUIRED: {} 浏览器会话验证已过期，请在 WebView2 登录窗口完成验证后重试", expected.host_str().unwrap_or_default())),
+    }
 }
 
 async fn eval_with_callback(window: &tauri::WebviewWindow, script: String, timeout: Duration) -> Result<String, String> {

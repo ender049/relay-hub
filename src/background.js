@@ -349,26 +349,112 @@ async function handleBrowserFetch(payload, parsedUrl) {
   if (!siteHostsMatch(parsedUrl.hostname, expectedUrl.hostname)) {
     throw new Error(`请求域名 ${parsedUrl.hostname} 与渠道站点 ${expectedUrl.hostname} 不匹配`);
   }
-  const tab = await findSiteTab(expectedUrl, '浏览器请求模式');
-  const currentUrl = parseHttpUrl(tab.url);
   const headers = sanitizeBrowserFetchHeaders(payload.headers || {});
   if (payload.kind === 'channel') {
     setDefaultHeader(headers, 'Accept', 'application/json, text/plain, */*');
     setDefaultHeader(headers, 'Accept-Language', 'zh-CN,zh;q=0.9,en;q=0.8');
   }
+  let session = await findSiteTab(expectedUrl, '浏览器请求模式')
+    .then(tab => ({ tab, created: false }))
+    .catch(() => openLoginSessionTab(payload, expectedUrl, false));
+  let response = await runBrowserFetchInTab(session.tab, payload, parsedUrl, headers);
+  if (isCloudflareChallengeResponse(response)) {
+    const retry = session.created
+      ? { tab: await prepareLoginSessionTab(session.tab, payload, expectedUrl, false), created: true }
+      : await openLoginSessionTab(payload, expectedUrl, false);
+    response = await runBrowserFetchInTab(session.created ? retry.tab : session.tab, payload, parsedUrl, headers);
+    if (isCloudflareChallengeResponse(response)) {
+      await focusTab(retry.tab.id).catch(() => {});
+      return browserSessionExpiredResponse(expectedUrl);
+    }
+    if (retry.created && !session.created) await chrome.tabs.remove(retry.tab.id).catch(() => {});
+  }
+  return response;
+}
+
+async function runBrowserFetchInTab(tab, payload, parsedUrl, headers) {
+  const currentTab = tab && tab.id ? await chrome.tabs.get(tab.id).catch(() => tab) : tab;
+  const currentUrl = parseHttpUrl(currentTab && currentTab.url);
   const [result] = await chrome.scripting.executeScript({
-    target: { tabId: tab.id },
+    target: { tabId: currentTab.id },
     func: browserFetchInPage,
     args: [{
       url: parsedUrl.href,
       method: payload.method || 'GET',
-      headers,
+      headers: { ...(headers || {}) },
       body: payload.body || null,
       siteType: payload.siteType || ''
     }]
   });
   const response = result && result.result ? result.result : { ok: false, status: 0, error: '浏览器请求没有返回结果' };
   return { ...response, pageUrl: currentUrl ? currentUrl.href : '' };
+}
+
+async function openLoginSessionTab(payload, expectedUrl, active) {
+  const tab = await chrome.tabs.create({ url: loginUrl(payload.siteUrl || expectedUrl.href, payload.siteType || ''), active: !!active });
+  return { tab: await prepareLoginSessionTab(tab, payload, expectedUrl, active), created: true };
+}
+
+async function prepareLoginSessionTab(tab, payload, expectedUrl, active) {
+  const tabId = typeof tab === 'number' ? tab : tab.id;
+  const update = { url: loginUrl(payload.siteUrl || expectedUrl.href, payload.siteType || '') };
+  if (active) update.active = true;
+  let next = await chrome.tabs.update(tabId, update);
+  await waitForTabComplete(tabId, 15000).catch(() => {});
+  await injectAutofill(tabId, payload.username || '', payload.password || '').catch(() => {});
+  await waitForCloudflareChallengeToSettle(tabId, 14000).catch(() => {});
+  await injectAutofill(tabId, payload.username || '', payload.password || '').catch(() => {});
+  next = await chrome.tabs.get(tabId).catch(() => next);
+  return next;
+}
+
+async function waitForCloudflareChallengeToSettle(tabId, timeoutMs) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    await sleep(600);
+    try {
+      const [result] = await chrome.scripting.executeScript({ target: { tabId }, func: cloudflareChallengeActiveInPage });
+      if (!result || result.result === false) return true;
+    } catch (_) {}
+  }
+  return false;
+}
+
+function cloudflareChallengeActiveInPage() {
+  if (document.readyState === 'loading') return true;
+  const root = document.documentElement;
+  const text = `${document.title || ''}\n${document.body ? document.body.innerText : ''}\n${root ? root.innerHTML.slice(0, 20000) : ''}`;
+  return /(just a moment|verify you are human|verifying you are human|checking your browser|managed challenge|challenge-platform|cdn-cgi\/challenge-platform|__cf_chl|cf-browser-verification|cloudflare ray id)/i.test(text);
+}
+
+function isCloudflareChallengeResponse(response) {
+  if (/BROWSER_SESSION_REVALIDATION_REQUIRED/i.test(String(response && response.error || ''))) return true;
+  const headers = response && response.headers || {};
+  const header = name => {
+    const lower = String(name).toLowerCase();
+    const key = Object.keys(headers).find(item => item.toLowerCase() === lower);
+    return key ? String(headers[key] || '') : '';
+  };
+  if (header('cf-mitigated').toLowerCase().includes('challenge')) return true;
+  const status = Number(response && response.status) || 0;
+  const body = String(response && response.body || '');
+  const lower = body.toLowerCase();
+  const contentType = header('content-type').toLowerCase();
+  const html = contentType.includes('text/html') || lower.includes('<html');
+  return [403, 429, 503].includes(status) && html && /(just a moment|verify you are human|verifying you are human|checking your browser|managed challenge|challenge-platform|cdn-cgi\/challenge-platform|__cf_chl|cf-chl|cf-turnstile|cf-browser-verification|cloudflare ray id)/i.test(body);
+}
+
+function browserSessionExpiredResponse(expectedUrl) {
+  return { ok: false, status: 0, headers: {}, body: '', error: `BROWSER_SESSION_REVALIDATION_REQUIRED: ${expectedUrl.hostname} 浏览器会话验证已过期，请在已打开的浏览器标签页完成验证后重试` };
+}
+
+async function focusTab(tabId) {
+  const tab = await chrome.tabs.update(tabId, { active: true });
+  if (tab && tab.windowId) await chrome.windows.update(tab.windowId, { focused: true });
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 async function browserFetchInPage(payload) {
