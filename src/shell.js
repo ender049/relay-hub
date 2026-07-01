@@ -3,6 +3,18 @@ const shellSideBtn = document.getElementById('shellSideBtn');
 
 const STORE_KEYS = ['apm_s', 'apm_ch', 'apm_tab', 'apm_font', 'relay_theme', 'apm_ar'];
 const OPEN_MODE_KEY = 'relay_open_mode';
+const HOST_CAPABILITIES = {
+  platform: 'extension',
+  nativeFetch: true,
+  openSidePanel: !!(chrome.sidePanel && chrome.sidePanel.open),
+  siteLogin: true,
+  siteTokenRead: true,
+  browserFetch: true,
+  browserFetchContext: 'extension-tab',
+  loginAutofill: true,
+  loginTargetName: '同域浏览器标签页',
+  tokenSourceName: '同域浏览器标签页'
+};
 
 function readStore() {
   const data = {};
@@ -42,9 +54,14 @@ async function sendOpenMode() {
   frame.contentWindow.postMessage({ type: 'RELAY_OPEN_MODE_DATA', mode }, '*');
 }
 
+function sendCapabilities() {
+  frame.contentWindow.postMessage({ type: 'RELAY_HOST_CAPABILITIES', capabilities: HOST_CAPABILITIES }, '*');
+}
+
 function sendInitialData() {
   sendStore();
   sendOpenMode();
+  sendCapabilities();
 }
 
 frame.addEventListener('load', sendInitialData);
@@ -83,6 +100,10 @@ window.addEventListener('message', async event => {
     await sendOpenMode();
     return;
   }
+  if (msg && msg.type === 'RELAY_HOST_CAPABILITIES_GET') {
+    sendCapabilities();
+    return;
+  }
   if (msg && msg.type === 'RELAY_OPEN_MODE_SET') {
     const mode = await writeOpenMode(msg.mode);
     frame.contentWindow.postMessage({ type: 'RELAY_OPEN_MODE_DATA', mode }, '*');
@@ -114,10 +135,21 @@ window.addEventListener('message', async event => {
     window.open(String(msg.url || ''), '_blank', 'noopener,noreferrer');
     return;
   }
+  if (msg && msg.type === 'RELAY_OPEN_SITE_LOGIN') {
+    let response;
+    try {
+      response = await chrome.runtime.sendMessage({ type: 'RELAY_OPEN_SITE_LOGIN', payload: msg.payload || {} });
+      if (!response) response = { ok: false, error: '扩展后台无响应' };
+    } catch (err) {
+      response = { ok: false, error: err && err.message ? err.message : String(err) };
+    }
+    frame.contentWindow.postMessage({ type: 'RELAY_OPEN_SITE_LOGIN_RESULT', response }, '*');
+    return;
+  }
   if (msg && msg.type === 'RELAY_READ_SITE_TOKENS') {
     let response;
     try {
-      response = await chrome.runtime.sendMessage({ type: 'RELAY_READ_SITE_TOKENS', siteUrl: msg.siteUrl });
+      response = await chrome.runtime.sendMessage({ type: 'RELAY_READ_SITE_TOKENS', siteUrl: msg.siteUrl, siteType: msg.siteType });
       if (!response) response = { ok: false, error: '扩展后台无响应' };
     } catch (err) {
       response = { ok: false, error: err && err.message ? err.message : String(err) };

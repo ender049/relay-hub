@@ -1,6 +1,18 @@
 const frame = document.getElementById('app');
 const invoke = window.__TAURI__.core.invoke;
 const listen = window.__TAURI__.event.listen;
+const HOST_CAPABILITIES = {
+  platform: 'tauri',
+  nativeFetch: true,
+  openSidePanel: false,
+  siteLogin: true,
+  siteTokenRead: true,
+  browserFetch: true,
+  browserFetchContext: 'tauri-webview',
+  loginAutofill: true,
+  loginTargetName: 'WebView2 登录窗口',
+  tokenSourceName: 'WebView2 登录窗口'
+};
 
 function sendToApp(message) {
   if (frame && frame.contentWindow) frame.contentWindow.postMessage(message, '*');
@@ -16,9 +28,14 @@ async function sendOpenMode() {
   sendToApp({ type: 'RELAY_OPEN_MODE_DATA', mode });
 }
 
+function sendCapabilities() {
+  sendToApp({ type: 'RELAY_HOST_CAPABILITIES', capabilities: HOST_CAPABILITIES });
+}
+
 function sendInitialData() {
   sendStore();
   sendOpenMode();
+  sendCapabilities();
 }
 
 frame.addEventListener('load', sendInitialData);
@@ -44,6 +61,10 @@ window.addEventListener('message', async event => {
   }
   if (msg && msg.type === 'RELAY_OPEN_MODE_GET') {
     await sendOpenMode();
+    return;
+  }
+  if (msg && msg.type === 'RELAY_HOST_CAPABILITIES_GET') {
+    sendCapabilities();
     return;
   }
   if (msg && msg.type === 'RELAY_OPEN_MODE_SET') {

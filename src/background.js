@@ -36,39 +36,234 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     handleExtensionFetch(msg.payload || {}).then(sendResponse);
     return true;
   }
+  if (msg.type === 'RELAY_OPEN_SITE_LOGIN') {
+    openSiteLogin(msg.payload || {}).then(sendResponse);
+    return true;
+  }
   if (msg.type === 'RELAY_READ_SITE_TOKENS') {
-    readSiteTokens(msg.siteUrl).then(sendResponse);
+    readSiteTokens(msg.siteUrl, msg.siteType).then(sendResponse);
     return true;
   }
   return false;
 });
 
-async function readSiteTokens(siteUrl) {
+async function openSiteLogin(payload = {}) {
+  try {
+    if (!chrome.scripting || !chrome.scripting.executeScript) throw new Error('当前浏览器不支持登录页代填');
+    const url = loginUrl(payload.siteUrl || '', payload.siteType || '');
+    const tab = await chrome.tabs.create({ url });
+    if (tab && tab.id) {
+      await waitForTabComplete(tab.id, 12000).catch(() => {});
+      await injectAutofill(tab.id, payload.username || '', payload.password || '').catch(() => {});
+    }
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err && err.message ? err.message : String(err) };
+  }
+}
+
+function waitForTabComplete(tabId, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    let done = false;
+    const timer = setTimeout(() => finish(false), timeoutMs || 10000);
+    const finish = ok => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      chrome.tabs.onUpdated.removeListener(listener);
+      ok ? resolve() : reject(new Error('等待登录页加载超时'));
+    };
+    const listener = (updatedTabId, info) => {
+      if (updatedTabId === tabId && info.status === 'complete') finish(true);
+    };
+    chrome.tabs.onUpdated.addListener(listener);
+    chrome.tabs.get(tabId, tab => {
+      if (chrome.runtime.lastError) return;
+      if (tab && tab.status === 'complete') finish(true);
+    });
+  });
+}
+
+async function injectAutofill(tabId, username, password) {
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    func: autofillLoginInPage,
+    args: [username || '', password || '']
+  });
+}
+
+function autofillLoginInPage(username, password) {
+  const visible = el => !!(el && el.offsetParent !== null && !el.disabled && !el.readOnly);
+  const setValue = (el, value) => {
+    if (!el || !value) return false;
+    const proto = Object.getPrototypeOf(el);
+    const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+    if (desc && desc.set) desc.set.call(el, value); else el.value = value;
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    return true;
+  };
+  const findUser = () => Array.from(document.querySelectorAll('input')).find(el => visible(el) && /^(email|text|tel|search)$/i.test(el.type || 'text') && /(user|email|mail|account|login|name|账号|邮箱|用户名)/i.test(`${el.name} ${el.id} ${el.placeholder} ${el.autocomplete}`)) || Array.from(document.querySelectorAll('input')).find(el => visible(el) && /^(email|text)$/i.test(el.type || 'text'));
+  const findPass = () => Array.from(document.querySelectorAll('input[type="password"]')).find(visible);
+  let tries = 0;
+  let timer = null;
+  const fill = () => {
+    tries += 1;
+    const okUser = setValue(findUser(), username) || !username;
+    const okPass = setValue(findPass(), password) || !password;
+    if (((okUser && okPass) || tries >= 20) && timer) clearInterval(timer);
+  };
+  fill();
+  timer = setInterval(fill, 400);
+}
+
+async function readSiteTokens(siteUrl, siteType) {
   try {
     if (!chrome.scripting || !chrome.scripting.executeScript) throw new Error('当前浏览器不支持读取页面令牌');
     const expectedUrl = parseHttpUrl(siteUrl);
-    if (!expectedUrl) throw new Error('请先填写 Sub2API 站点地址');
-    const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-    const tab = tabs[0];
-    if (!tab || !tab.id || !tab.url) throw new Error('请先切换到已登录的 Sub2API 站点标签页');
+    if (!expectedUrl) throw new Error('请先填写渠道站点地址');
+    const tab = await findSiteTab(expectedUrl, '读取令牌');
     const currentUrl = parseHttpUrl(tab.url);
-    if (!currentUrl) throw new Error('请先切换到已登录的 Sub2API 站点标签页');
-    if (!siteHostsMatch(currentUrl.hostname, expectedUrl.hostname)) {
-      throw new Error(`当前标签页域名 ${currentUrl.hostname} 与渠道站点 ${expectedUrl.hostname} 不匹配`);
-    }
     const [result] = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
-      func: () => ({
-        auth_token: localStorage.getItem('auth_token') || '',
-        access_token: localStorage.getItem('access_token') || '',
-        refresh_token: localStorage.getItem('refresh_token') || '',
-        token_expires_at: localStorage.getItem('token_expires_at') || ''
-      })
+      func: extractSiteTokensInPage,
+      args: [siteType || '']
     });
     return { ok: true, siteUrl: expectedUrl.href, pageUrl: currentUrl.href, ...(result && result.result ? result.result : {}) };
   } catch (err) {
     return { ok: false, error: err && err.message ? err.message : String(err) };
   }
+}
+
+function loginUrl(siteUrl, siteType) {
+  const url = parseHttpUrl(siteUrl);
+  if (!url) throw new Error('请先填写有效的渠道站点地址');
+  const path = url.pathname.replace(/\/+$/, '');
+  if (!path || path === '/' || path.startsWith('/api') || (siteType === 'sub2api' && path.endsWith('/api/v1'))) {
+    url.pathname = '/login';
+  }
+  url.search = '';
+  url.hash = '';
+  return url.href;
+}
+
+async function findSiteTab(expectedUrl, action) {
+  const active = await chrome.tabs.query({ active: true, currentWindow: true });
+  const activeTab = active.find(tab => tab && tab.id && tab.url && tabMatchesSite(tab, expectedUrl));
+  if (activeTab) return activeTab;
+  const tabs = await chrome.tabs.query({});
+  const tab = tabs.find(item => item && item.id && item.url && tabMatchesSite(item, expectedUrl));
+  if (tab) return tab;
+  throw new Error(`${action}需要先打开并登录 ${expectedUrl.hostname} 标签页`);
+}
+
+function tabMatchesSite(tab, expectedUrl) {
+  const currentUrl = parseHttpUrl(tab.url);
+  return !!(currentUrl && siteHostsMatch(currentUrl.hostname, expectedUrl.hostname));
+}
+
+async function extractSiteTokensInPage(siteType) {
+  const dump = store => {
+    const out = {};
+    for (let i = 0; i < store.length; i += 1) {
+      const key = store.key(i);
+      out[key] = store.getItem(key);
+    }
+    return out;
+  };
+  const safeJson = value => {
+    try { return JSON.parse(value); } catch (_) { return value; }
+  };
+  const flatten = value => {
+    const out = [];
+    const walk = (path, item) => {
+      if (item == null) return;
+      if (typeof item === 'string') {
+        out.push([path, item]);
+        const parsed = safeJson(item);
+        if (parsed !== item) walk(path, parsed);
+      } else if (typeof item === 'number' || typeof item === 'boolean') {
+        out.push([path, String(item)]);
+      } else if (Array.isArray(item)) {
+        item.forEach((child, index) => walk(`${path}.${index}`, child));
+      } else if (typeof item === 'object') {
+        Object.entries(item).forEach(([key, child]) => walk(path ? `${path}.${key}` : key, child));
+      }
+    };
+    walk('', value);
+    return out;
+  };
+  const normalize = value => String(value || '').replace(/[^a-z0-9]/gi, '').toLowerCase();
+  const useful = value => {
+    const text = String(value || '').trim();
+    return text && text !== 'null' && text !== 'undefined' && text !== '0';
+  };
+  const pick = (values, names) => {
+    const wanted = names.map(normalize);
+    for (const [key, value] of values) {
+      const leaf = String(key || '').split('.').pop();
+      if (wanted.includes(normalize(leaf)) && useful(value)) return String(value).trim();
+    }
+    for (const [key, value] of values) {
+      const normalized = normalize(key);
+      if (wanted.some(name => normalized.includes(name)) && useful(value)) return String(value).trim();
+    }
+    return '';
+  };
+  const pickJwt = values => {
+    const hit = values.find(([, value]) => {
+      const text = String(value || '').trim();
+      return text.length > 24 && (text.match(/\./g) || []).length === 2 && /^[A-Za-z0-9._=-]+$/.test(text);
+    });
+    return hit ? String(hit[1]).trim() : '';
+  };
+  const findUserId = value => {
+    if (value == null) return '';
+    if (Array.isArray(value)) return value.map(findUserId).find(Boolean) || '';
+    if (typeof value !== 'object') return '';
+    for (const key of ['id', 'user_id', 'userId', 'uid']) {
+      const item = value[key];
+      if (typeof item === 'string' && item.trim()) return item.trim();
+      if (typeof item === 'number') return String(item);
+    }
+    return Object.values(value).map(findUserId).find(Boolean) || '';
+  };
+
+  const storage = {
+    localStorage: Object.fromEntries(Object.entries(dump(localStorage)).map(([key, value]) => [key, safeJson(value)])),
+    sessionStorage: Object.fromEntries(Object.entries(dump(sessionStorage)).map(([key, value]) => [key, safeJson(value)])),
+    documentCookie: document.cookie || ''
+  };
+  const values = flatten(storage);
+  String(document.cookie || '').split(';').forEach(part => {
+    const index = part.indexOf('=');
+    if (index > 0) values.push([part.slice(0, index).trim(), part.slice(index + 1).trim()]);
+  });
+
+  let token = pick(values, ['auth_token', 'authToken', 'access_token', 'accessToken', 'bearerToken', 'jwt', 'token']) || pickJwt(values);
+  const refresh = pick(values, ['refresh_token', 'refreshToken', 'refresh']);
+  const expires = pick(values, ['token_expires_at', 'tokenExpiresAt', 'accessTokenExpiresAt', 'expires_at', 'expiresAt', 'expireAt']);
+  let userId = pick(values, ['user_id', 'userId', 'uid', 'id']);
+
+  if (siteType === 'newapi' && !userId) {
+    try {
+      const headers = {};
+      if (token) headers.Authorization = /^Bearer\s+/i.test(token) ? token : `Bearer ${token}`;
+      const res = await fetch('/api/user/self', { headers, credentials: 'include', cache: 'no-store' });
+      const json = await res.json();
+      userId = findUserId(json);
+    } catch (_) {}
+  }
+
+  return {
+    auth_token: token,
+    access_token: token,
+    refresh_token: refresh,
+    cookie: document.cookie || '',
+    token_expires_at: expires,
+    user_id: userId,
+    userId
+  };
 }
 
 function parseHttpUrl(value) {
@@ -110,6 +305,9 @@ async function handleExtensionFetch(payload) {
     const url = payload.url;
     const parsed = new URL(url);
     const kind = payload.kind || 'channel';
+    if (kind === 'channel' && payload.browserFetch === true) {
+      return handleBrowserFetch(payload, parsed);
+    }
     const headers = sanitizeHeaders(payload.headers || {});
     if (kind === 'channel') {
       setDefaultHeader(headers, 'Accept', 'application/json, text/plain, */*');
@@ -124,7 +322,6 @@ async function handleExtensionFetch(payload) {
     };
     if (kind === 'channel') fetchOptions.credentials = 'include';
     const res = await fetch(url, fetchOptions);
-    console.info('[Relay Hub fetch]', kind, payload.method || 'GET', parsed.href, res.status);
     const responseHeaders = {};
     res.headers.forEach((value, key) => {
       responseHeaders[key] = value;
@@ -140,8 +337,161 @@ async function handleExtensionFetch(payload) {
     }
     return { ok: res.ok, status: res.status, headers: responseHeaders, body: await res.text() };
   } catch (err) {
-    console.warn('[Relay Hub fetch failed]', payload && payload.url, err);
     return { ok: false, status: 0, error: err && err.message ? err.message : String(err) };
+  }
+}
+
+async function handleBrowserFetch(payload, parsedUrl) {
+  if (!chrome.scripting || !chrome.scripting.executeScript) throw new Error('当前浏览器不支持浏览器请求模式');
+  if (payload.responseType === 'base64' || payload.bodyBase64) throw new Error('浏览器请求模式暂不支持二进制请求或响应');
+  const expectedUrl = parseHttpUrl(payload.siteUrl || payload.url);
+  if (!expectedUrl) throw new Error('浏览器请求模式缺少有效的渠道站点地址');
+  if (!siteHostsMatch(parsedUrl.hostname, expectedUrl.hostname)) {
+    throw new Error(`请求域名 ${parsedUrl.hostname} 与渠道站点 ${expectedUrl.hostname} 不匹配`);
+  }
+  const tab = await findSiteTab(expectedUrl, '浏览器请求模式');
+  const currentUrl = parseHttpUrl(tab.url);
+  const headers = sanitizeBrowserFetchHeaders(payload.headers || {});
+  if (payload.kind === 'channel') {
+    setDefaultHeader(headers, 'Accept', 'application/json, text/plain, */*');
+    setDefaultHeader(headers, 'Accept-Language', 'zh-CN,zh;q=0.9,en;q=0.8');
+  }
+  const [result] = await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    func: browserFetchInPage,
+    args: [{
+      url: parsedUrl.href,
+      method: payload.method || 'GET',
+      headers,
+      body: payload.body || null,
+      siteType: payload.siteType || ''
+    }]
+  });
+  const response = result && result.result ? result.result : { ok: false, status: 0, error: '浏览器请求没有返回结果' };
+  return { ...response, pageUrl: currentUrl ? currentUrl.href : '' };
+}
+
+async function browserFetchInPage(payload) {
+  const setHeader = (headers, name, value) => {
+    if (!value) return;
+    const lower = name.toLowerCase();
+    Object.keys(headers).forEach(key => {
+      if (key.toLowerCase() === lower) delete headers[key];
+    });
+    headers[name] = String(value);
+  };
+  const collectPageAuth = async siteType => {
+    const dump = store => {
+      const out = {};
+      for (let i = 0; i < store.length; i += 1) {
+        const key = store.key(i);
+        out[key] = store.getItem(key);
+      }
+      return out;
+    };
+    const safeJson = value => {
+      try { return JSON.parse(value); } catch (_) { return value; }
+    };
+    const flatten = value => {
+      const out = [];
+      const walk = (path, item) => {
+        if (item == null) return;
+        if (typeof item === 'string') {
+          out.push([path, item]);
+          const parsed = safeJson(item);
+          if (parsed !== item) walk(path, parsed);
+        } else if (typeof item === 'number' || typeof item === 'boolean') {
+          out.push([path, String(item)]);
+        } else if (Array.isArray(item)) {
+          item.forEach((child, index) => walk(`${path}.${index}`, child));
+        } else if (typeof item === 'object') {
+          Object.entries(item).forEach(([key, child]) => walk(path ? `${path}.${key}` : key, child));
+        }
+      };
+      walk('', value);
+      return out;
+    };
+    const normalize = value => String(value || '').replace(/[^a-z0-9]/gi, '').toLowerCase();
+    const useful = value => {
+      const text = String(value || '').trim();
+      return text && text !== 'null' && text !== 'undefined' && text !== '0';
+    };
+    const pick = (values, names) => {
+      const wanted = names.map(normalize);
+      for (const [key, value] of values) {
+        const leaf = String(key || '').split('.').pop();
+        if (wanted.includes(normalize(leaf)) && useful(value)) return String(value).trim();
+      }
+      for (const [key, value] of values) {
+        const normalized = normalize(key);
+        if (wanted.some(name => normalized.includes(name)) && useful(value)) return String(value).trim();
+      }
+      return '';
+    };
+    const pickJwt = values => {
+      const hit = values.find(([, value]) => {
+        const text = String(value || '').trim();
+        return text.length > 24 && (text.match(/\./g) || []).length === 2 && /^[A-Za-z0-9._=-]+$/.test(text);
+      });
+      return hit ? String(hit[1]).trim() : '';
+    };
+    const findUserId = value => {
+      if (value == null) return '';
+      if (Array.isArray(value)) return value.map(findUserId).find(Boolean) || '';
+      if (typeof value !== 'object') return '';
+      for (const key of ['id', 'user_id', 'userId', 'uid']) {
+        const item = value[key];
+        if (typeof item === 'string' && item.trim()) return item.trim();
+        if (typeof item === 'number') return String(item);
+      }
+      return Object.values(value).map(findUserId).find(Boolean) || '';
+    };
+    const storage = {
+      localStorage: Object.fromEntries(Object.entries(dump(localStorage)).map(([key, value]) => [key, safeJson(value)])),
+      sessionStorage: Object.fromEntries(Object.entries(dump(sessionStorage)).map(([key, value]) => [key, safeJson(value)])),
+      documentCookie: document.cookie || ''
+    };
+    const values = flatten(storage);
+    String(document.cookie || '').split(';').forEach(part => {
+      const index = part.indexOf('=');
+      if (index > 0) values.push([part.slice(0, index).trim(), part.slice(index + 1).trim()]);
+    });
+    const token = pick(values, ['auth_token', 'authToken', 'access_token', 'accessToken', 'bearerToken', 'jwt', 'token']) || pickJwt(values);
+    const userId = pick(values, ['user_id', 'userId', 'uid', 'id']);
+    return { token, userId };
+  };
+
+  try {
+    const headers = { ...(payload.headers || {}) };
+    const pageAuth = await collectPageAuth(payload.siteType || '');
+    if (pageAuth.token) setHeader(headers, 'Authorization', /^Bearer\s+/i.test(pageAuth.token) ? pageAuth.token : 'Bearer ' + pageAuth.token);
+    if (payload.siteType === 'newapi' && pageAuth.userId) setHeader(headers, 'New-Api-User', pageAuth.userId);
+    const init = {
+      method: payload.method || 'GET',
+      headers,
+      credentials: 'include',
+      cache: 'no-store'
+    };
+    if (payload.body != null && !/^(GET|HEAD)$/i.test(init.method)) init.body = payload.body;
+    const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    const timer = controller ? setTimeout(() => controller.abort(), 25000) : null;
+    if (controller) init.signal = controller.signal;
+    let res;
+    try {
+      res = await fetch(payload.url, init);
+    } catch (err) {
+      if (err && err.name === 'AbortError') throw new Error('浏览器请求超时');
+      throw err;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+    const responseHeaders = {};
+    res.headers.forEach((value, key) => {
+      responseHeaders[key] = value;
+    });
+    return { ok: res.ok, status: res.status, headers: responseHeaders, body: await res.text() };
+  } catch (err) {
+    return { ok: false, status: 0, headers: {}, body: '', error: err && err.message ? err.message : String(err) };
   }
 }
 
@@ -161,12 +511,21 @@ const FORBIDDEN_REQUEST_HEADERS = new Set([
 ]);
 
 function sanitizeHeaders(input) {
+  return sanitizeHeadersWithForbidden(input, FORBIDDEN_REQUEST_HEADERS);
+}
+
+function sanitizeBrowserFetchHeaders(input) {
+  const forbidden = new Set([...FORBIDDEN_REQUEST_HEADERS, 'cookie']);
+  return sanitizeHeadersWithForbidden(input, forbidden);
+}
+
+function sanitizeHeadersWithForbidden(input, forbidden) {
   const out = {};
   Object.entries(input || {}).forEach(([key, value]) => {
     const name = String(key || '').trim();
     const lower = name.toLowerCase();
     if (!name || value == null) return;
-    if (lower.startsWith('proxy-') || lower.startsWith('sec-') || FORBIDDEN_REQUEST_HEADERS.has(lower)) return;
+    if (lower.startsWith('proxy-') || lower.startsWith('sec-') || forbidden.has(lower)) return;
     out[name] = String(value);
   });
   return out;

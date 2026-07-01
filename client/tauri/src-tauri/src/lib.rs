@@ -2,11 +2,10 @@ use base64::{engine::general_purpose, Engine as _};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::{collections::HashSet, fs, path::PathBuf, sync::{mpsc, Mutex}, thread, time::Duration};
+use std::{collections::HashSet, fs, path::PathBuf, sync::{atomic::{AtomicU64, Ordering}, mpsc, Mutex}, thread, time::{Duration, Instant}};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    webview::PageLoadEvent,
     AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent,
 };
 use tauri_plugin_clipboard_manager::ClipboardExt;
@@ -16,6 +15,7 @@ const STORE_KEYS: &[&str] = &["apm_s", "apm_ch", "apm_tab", "apm_font", "relay_t
 const OPEN_MODE_KEY: &str = "relay_open_mode";
 const LEGACY_IDENTIFIER: &str = "works.earendil.relayhub";
 const LOGIN_WINDOW_LABEL: &str = "channel-login";
+static BROWSER_FETCH_SEQ: AtomicU64 = AtomicU64::new(1);
 
 struct AppState {
     store: Mutex<Map<String, Value>>,
@@ -33,6 +33,12 @@ struct FetchPayload {
     body_base64: Option<String>,
     #[serde(rename = "responseType")]
     response_type: Option<String>,
+    #[serde(rename = "browserFetch")]
+    browser_fetch: Option<bool>,
+    #[serde(rename = "siteUrl")]
+    site_url: Option<String>,
+    #[serde(rename = "siteType")]
+    site_type: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -296,8 +302,8 @@ async fn relay_read_site_tokens(app: AppHandle, state: State<'_, AppState>, site
 }
 
 #[tauri::command]
-async fn relay_fetch(state: State<'_, AppState>, payload: FetchPayload) -> Result<FetchResponse, String> {
-    Ok(match do_fetch(&state.client, payload).await {
+async fn relay_fetch(app: AppHandle, state: State<'_, AppState>, payload: FetchPayload) -> Result<FetchResponse, String> {
+    Ok(match do_fetch(&app, &state.client, payload).await {
         Ok(response) => response,
         Err(error) => FetchResponse { ok: false, status: 0, headers: Map::new(), body: String::new(), error: Some(error) },
     })
@@ -323,33 +329,47 @@ fn login_url(site_url: &str, site_type: Option<&str>) -> Result<Url, String> {
 async fn open_site_login_window(app: &AppHandle, payload: LoginPayload) -> Result<(), String> {
     let url = login_url(&payload.site_url, payload.site_type.as_deref())?;
     let autofill = autofill_script(payload.username.as_deref().unwrap_or_default(), payload.password.as_deref().unwrap_or_default());
+    let window = ensure_login_window(app, true)?;
+    window.navigate(url).map_err(|err| err.to_string())?;
+    schedule_autofill(window, autofill);
+    Ok(())
+}
 
+fn ensure_login_window(app: &AppHandle, visible: bool) -> Result<tauri::WebviewWindow, String> {
     if let Some(window) = app.get_webview_window(LOGIN_WINDOW_LABEL) {
-        window.navigate(url).map_err(|err| err.to_string())?;
-        let _ = window.show();
-        let _ = window.unminimize();
-        let _ = window.set_focus();
-        schedule_autofill(window, autofill);
-        return Ok(());
+        if visible {
+            let _ = window.show();
+            let _ = window.unminimize();
+            let _ = window.set_focus();
+        }
+        return Ok(window);
     }
 
-    let autofill_on_load = autofill.clone();
-    let window = WebviewWindowBuilder::new(app, LOGIN_WINDOW_LABEL, WebviewUrl::External(url))
+    let window = WebviewWindowBuilder::new(app, LOGIN_WINDOW_LABEL, WebviewUrl::App("login-loading.html".into()))
         .title("Relay Hub 登录接管")
         .inner_size(980.0, 760.0)
         .min_inner_size(520.0, 560.0)
         .resizable(true)
         .center()
-        .on_page_load(move |window, payload| {
-            if payload.event() == PageLoadEvent::Finished {
-                let _ = window.eval(autofill_on_load.clone());
-            }
-        })
+        .visible(visible)
+        .focused(visible)
         .build()
         .map_err(|err| err.to_string())?;
-    let _ = window.set_focus();
-    schedule_autofill(window, autofill);
-    Ok(())
+    keep_login_window_alive(&window);
+    if visible {
+        let _ = window.set_focus();
+    }
+    Ok(window)
+}
+
+fn keep_login_window_alive(window: &tauri::WebviewWindow) {
+    let login = window.clone();
+    window.on_window_event(move |event| {
+        if let WindowEvent::CloseRequested { api, .. } = event {
+            api.prevent_close();
+            let _ = login.hide();
+        }
+    });
 }
 
 fn schedule_autofill(window: tauri::WebviewWindow, script: String) {
@@ -379,14 +399,15 @@ fn autofill_script(username: &str, password: &str) -> String {
   const findUser = () => Array.from(document.querySelectorAll('input')).find(el => visible(el) && /^(email|text|tel|search)$/i.test(el.type || 'text') && /(user|email|mail|account|login|name|账号|邮箱|用户名)/i.test(`${{el.name}} ${{el.id}} ${{el.placeholder}} ${{el.autocomplete}}`)) || Array.from(document.querySelectorAll('input')).find(el => visible(el) && /^(email|text)$/i.test(el.type || 'text'));
   const findPass = () => Array.from(document.querySelectorAll('input[type="password"]')).find(visible);
   let tries = 0;
+  let timer = null;
   const fill = () => {{
     tries += 1;
     const okUser = setValue(findUser(), username) || !username;
     const okPass = setValue(findPass(), password) || !password;
-    if ((okUser && okPass) || tries >= 20) clearInterval(timer);
+    if (((okUser && okPass) || tries >= 20) && timer) clearInterval(timer);
   }};
   fill();
-  const timer = setInterval(fill, 400);
+  timer = setInterval(fill, 400);
 }})();"#,
         username = serde_json::to_string(username).unwrap_or_else(|_| "\"\"".to_string()),
         password = serde_json::to_string(password).unwrap_or_else(|_| "\"\"".to_string()),
@@ -635,8 +656,11 @@ fn registrable_host(host: &str) -> String {
     }
 }
 
-async fn do_fetch(client: &reqwest::Client, payload: FetchPayload) -> Result<FetchResponse, String> {
+async fn do_fetch(app: &AppHandle, client: &reqwest::Client, payload: FetchPayload) -> Result<FetchResponse, String> {
     let url = Url::parse(&payload.url).map_err(|err| err.to_string())?;
+    if payload.browser_fetch == Some(true) && payload.kind.as_deref() == Some("channel") {
+        return do_browser_fetch(app, &url, payload).await;
+    }
     let method = payload.method.unwrap_or_else(|| "GET".to_string()).parse().map_err(|err| format!("invalid method: {err}"))?;
     let mut request = client.request(method, url);
     let headers = sanitize_headers(payload.headers.as_ref());
@@ -672,6 +696,265 @@ async fn do_fetch(client: &reqwest::Client, payload: FetchPayload) -> Result<Fet
     Ok(FetchResponse { ok, status, headers: response_headers, body, error: None })
 }
 
+async fn do_browser_fetch(app: &AppHandle, url: &Url, payload: FetchPayload) -> Result<FetchResponse, String> {
+    let site_url = payload.site_url.as_deref().unwrap_or(&payload.url);
+    let expected = Url::parse(site_url).map_err(|_| "浏览器请求模式缺少有效的渠道站点地址".to_string())?;
+    if !site_hosts_match(url.host_str().unwrap_or_default(), expected.host_str().unwrap_or_default()) {
+        return Err(format!("请求域名 {} 与渠道站点 {} 不匹配", url.host_str().unwrap_or_default(), expected.host_str().unwrap_or_default()));
+    }
+    let site_type = payload.site_type.as_deref().unwrap_or("channel");
+    let window = ensure_login_window(app, false)?;
+    let mut current = window.url().map_err(|err| err.to_string())?;
+    if !site_hosts_match(current.host_str().unwrap_or_default(), expected.host_str().unwrap_or_default()) {
+        let login = login_url(site_url, payload.site_type.as_deref())?;
+        window.navigate(login).map_err(|err| err.to_string())?;
+        sleep_async(Duration::from_millis(1200)).await?;
+        current = window.url().map_err(|err| err.to_string())?;
+    }
+    if !site_hosts_match(current.host_str().unwrap_or_default(), expected.host_str().unwrap_or_default()) {
+        return Err(format!("{site_type} 浏览器请求模式需要打开登录页并完成登录"));
+    }
+
+    let request_id = format!("relay_fetch_{}", BROWSER_FETCH_SEQ.fetch_add(1, Ordering::Relaxed));
+    window.eval(browser_fetch_start_script(&payload, &request_id)?).map_err(|err| err.to_string())?;
+
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(30) {
+        sleep_async(Duration::from_millis(200)).await?;
+        let raw = eval_with_callback(&window, browser_fetch_poll_script(&request_id)?, Duration::from_secs(5)).await?;
+        let value: Value = serde_json::from_str(&raw).map_err(|err| err.to_string())?;
+        if !value.is_null() {
+            return parse_browser_fetch_response(&raw);
+        }
+    }
+    let _ = window.eval(browser_fetch_cleanup_script(&request_id)?);
+    Err("浏览器请求超时".to_string())
+}
+
+fn browser_fetch_start_script(payload: &FetchPayload, request_id: &str) -> Result<String, String> {
+    if payload.response_type.as_deref() == Some("base64") || payload.body_base64.as_deref().is_some_and(|value| !value.is_empty()) {
+        return Err("浏览器请求模式暂不支持二进制请求或响应".to_string());
+    }
+    let id = serde_json::to_string(request_id).map_err(|err| err.to_string())?;
+    let url = serde_json::to_string(&payload.url).map_err(|err| err.to_string())?;
+    let method = serde_json::to_string(payload.method.as_deref().unwrap_or("GET")).map_err(|err| err.to_string())?;
+    let headers = serde_json::to_string(&browser_fetch_headers(payload.headers.as_ref())).map_err(|err| err.to_string())?;
+    let body = serde_json::to_string(&payload.body.as_deref()).map_err(|err| err.to_string())?;
+    let site_type = serde_json::to_string(payload.site_type.as_deref().unwrap_or_default()).map_err(|err| err.to_string())?;
+    let auth_script = browser_fetch_auth_helper_script();
+    Ok(format!(r#"(() => {{
+  const id = {id};
+  const store = window.__relayHubFetchResults = window.__relayHubFetchResults || {{}};
+  store[id] = {{ done: false, result: null }};
+  (async () => {{
+    try {{
+      const body = {body};
+      const siteType = {site_type};
+      const headers = {headers};
+{auth_script}
+      const pageAuth = await relayHubCollectPageAuth(siteType);
+      if (pageAuth.token) relayHubSetHeader(headers, 'Authorization', /^Bearer\s+/i.test(pageAuth.token) ? pageAuth.token : 'Bearer ' + pageAuth.token);
+      if (siteType === 'newapi' && pageAuth.userId) relayHubSetHeader(headers, 'New-Api-User', pageAuth.userId);
+      const init = {{
+        method: {method},
+        headers,
+        credentials: 'include',
+        cache: 'no-store'
+      }};
+      if (body !== null && !/^(GET|HEAD)$/i.test(init.method)) init.body = body;
+      const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+      const timer = controller ? setTimeout(() => controller.abort(), 25000) : null;
+      if (controller) init.signal = controller.signal;
+      let res;
+      try {{
+        res = await fetch({url}, init);
+      }} catch (err) {{
+        if (err && err.name === 'AbortError') throw new Error('浏览器请求超时');
+        throw err;
+      }} finally {{
+        if (timer) clearTimeout(timer);
+      }}
+      const responseHeaders = {{}};
+      res.headers.forEach((value, key) => {{ responseHeaders[key] = value; }});
+      store[id] = {{ done: true, result: {{ ok: res.ok, status: res.status, headers: responseHeaders, body: await res.text() }} }};
+    }} catch (err) {{
+      store[id] = {{ done: true, result: {{ ok: false, status: 0, headers: {{}}, body: '', error: err && err.message ? err.message : String(err) }} }};
+    }}
+  }})();
+  return true;
+}})()"#))
+}
+
+fn browser_fetch_auth_helper_script() -> &'static str {
+    r#"      function relayHubSetHeader(headers, name, value) {
+        if (!value) return;
+        const lower = name.toLowerCase();
+        Object.keys(headers).forEach(key => {
+          if (key.toLowerCase() === lower) delete headers[key];
+        });
+        headers[name] = String(value);
+      }
+      async function relayHubCollectPageAuth(siteType) {
+        const dump = store => {
+          const out = {};
+          for (let i = 0; i < store.length; i += 1) {
+            const key = store.key(i);
+            out[key] = store.getItem(key);
+          }
+          return out;
+        };
+        const safeJson = value => {
+          try { return JSON.parse(value); } catch (_) { return value; }
+        };
+        const flatten = value => {
+          const out = [];
+          const walk = (path, item) => {
+            if (item == null) return;
+            if (typeof item === 'string') {
+              out.push([path, item]);
+              const parsed = safeJson(item);
+              if (parsed !== item) walk(path, parsed);
+            } else if (typeof item === 'number' || typeof item === 'boolean') {
+              out.push([path, String(item)]);
+            } else if (Array.isArray(item)) {
+              item.forEach((child, index) => walk(`${path}.${index}`, child));
+            } else if (typeof item === 'object') {
+              Object.entries(item).forEach(([key, child]) => walk(path ? `${path}.${key}` : key, child));
+            }
+          };
+          walk('', value);
+          return out;
+        };
+        const normalize = value => String(value || '').replace(/[^a-z0-9]/gi, '').toLowerCase();
+        const useful = value => {
+          const text = String(value || '').trim();
+          return text && text !== 'null' && text !== 'undefined' && text !== '0';
+        };
+        const pick = (values, names) => {
+          const wanted = names.map(normalize);
+          for (const [key, value] of values) {
+            const leaf = String(key || '').split('.').pop();
+            if (wanted.includes(normalize(leaf)) && useful(value)) return String(value).trim();
+          }
+          for (const [key, value] of values) {
+            const normalized = normalize(key);
+            if (wanted.some(name => normalized.includes(name)) && useful(value)) return String(value).trim();
+          }
+          return '';
+        };
+        const pickJwt = values => {
+          const hit = values.find(([, value]) => {
+            const text = String(value || '').trim();
+            return text.length > 24 && (text.match(/\./g) || []).length === 2 && /^[A-Za-z0-9._=-]+$/.test(text);
+          });
+          return hit ? String(hit[1]).trim() : '';
+        };
+        const findUserId = value => {
+          if (value == null) return '';
+          if (Array.isArray(value)) return value.map(findUserId).find(Boolean) || '';
+          if (typeof value !== 'object') return '';
+          for (const key of ['id', 'user_id', 'userId', 'uid']) {
+            const item = value[key];
+            if (typeof item === 'string' && item.trim()) return item.trim();
+            if (typeof item === 'number') return String(item);
+          }
+          return Object.values(value).map(findUserId).find(Boolean) || '';
+        };
+        const storage = {
+          localStorage: Object.fromEntries(Object.entries(dump(localStorage)).map(([key, value]) => [key, safeJson(value)])),
+          sessionStorage: Object.fromEntries(Object.entries(dump(sessionStorage)).map(([key, value]) => [key, safeJson(value)])),
+          documentCookie: document.cookie || ''
+        };
+        const values = flatten(storage);
+        String(document.cookie || '').split(';').forEach(part => {
+          const index = part.indexOf('=');
+          if (index > 0) values.push([part.slice(0, index).trim(), part.slice(index + 1).trim()]);
+        });
+        const token = pick(values, ['auth_token', 'authToken', 'access_token', 'accessToken', 'bearerToken', 'jwt', 'token']) || pickJwt(values);
+        const userId = pick(values, ['user_id', 'userId', 'uid', 'id']);
+        return { token, userId };
+      }
+"#
+}
+
+fn browser_fetch_poll_script(request_id: &str) -> Result<String, String> {
+    let id = serde_json::to_string(request_id).map_err(|err| err.to_string())?;
+    Ok(format!(r#"(() => {{
+  const store = window.__relayHubFetchResults || {{}};
+  const item = store[{id}];
+  if (!item || !item.done) return null;
+  delete store[{id}];
+  return item.result || null;
+}})()"#))
+}
+
+fn browser_fetch_cleanup_script(request_id: &str) -> Result<String, String> {
+    let id = serde_json::to_string(request_id).map_err(|err| err.to_string())?;
+    Ok(format!(r#"(() => {{
+  const store = window.__relayHubFetchResults || {{}};
+  delete store[{id}];
+}})()"#))
+}
+
+async fn eval_with_callback(window: &tauri::WebviewWindow, script: String, timeout: Duration) -> Result<String, String> {
+    let (tx, rx) = mpsc::channel();
+    window.eval_with_callback(script, move |value| {
+        let _ = tx.send(value);
+    }).map_err(|err| err.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || rx.recv_timeout(timeout))
+        .await
+        .map_err(|err| err.to_string())?
+        .map_err(|_| "读取浏览器请求结果超时".to_string())
+}
+
+async fn sleep_async(duration: Duration) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || thread::sleep(duration))
+        .await
+        .map_err(|err| err.to_string())
+}
+
+fn browser_fetch_headers(input: Option<&Map<String, Value>>) -> Map<String, Value> {
+    let forbidden: HashSet<&'static str> = [
+        "accept-charset", "accept-encoding", "access-control-request-headers",
+        "access-control-request-method", "connection", "content-length", "cookie",
+        "cookie2", "date", "dnt", "expect", "host", "keep-alive", "origin",
+        "permissions-policy", "referer", "te", "trailer", "transfer-encoding",
+        "upgrade", "user-agent", "via",
+    ].into_iter().collect();
+    let mut headers = Map::new();
+    if let Some(input) = input {
+        for (key, value) in input.iter() {
+            let name = key.trim();
+            let lower = name.to_ascii_lowercase();
+            if name.is_empty() || lower.starts_with("proxy-") || lower.starts_with("sec-") || forbidden.contains(lower.as_str()) {
+                continue;
+            }
+            if let Some(text) = value.as_str() {
+                headers.insert(name.to_string(), Value::String(text.to_string()));
+            }
+        }
+    }
+    headers
+}
+
+fn parse_browser_fetch_response(raw: &str) -> Result<FetchResponse, String> {
+    let mut value: Value = serde_json::from_str(raw).map_err(|err| err.to_string())?;
+    if let Some(text) = value.as_str() {
+        value = serde_json::from_str(text).map_err(|err| err.to_string())?;
+    }
+    let Some(map) = value.as_object() else {
+        return Err("浏览器请求返回格式无效".to_string());
+    };
+    let headers = map.get("headers").and_then(Value::as_object).cloned().unwrap_or_default();
+    Ok(FetchResponse {
+        ok: map.get("ok").and_then(Value::as_bool).unwrap_or(false),
+        status: map.get("status").and_then(Value::as_u64).unwrap_or(0) as u16,
+        headers,
+        body: map.get("body").and_then(Value::as_str).unwrap_or_default().to_string(),
+        error: map.get("error").and_then(Value::as_str).map(str::to_string),
+    })
+}
+
 fn sanitize_headers(input: Option<&Map<String, Value>>) -> HeaderMap {
     let forbidden: HashSet<&'static str> = [
         "accept-charset", "accept-encoding", "access-control-request-headers",
@@ -699,6 +982,9 @@ fn sanitize_headers(input: Option<&Map<String, Value>>) -> HeaderMap {
 
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            show_main_window(app);
+        }))
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {

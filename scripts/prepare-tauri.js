@@ -186,6 +186,7 @@ ensureWindowsIcon();
 fs.rmSync(OUT, { recursive: true, force: true });
 fs.mkdirSync(OUT, { recursive: true });
 copyFile(path.join(ROOT, 'client', 'tauri', 'index.html'), path.join(OUT, 'index.html'));
+copyFile(path.join(ROOT, 'client', 'tauri', 'login-loading.html'), path.join(OUT, 'login-loading.html'));
 copyFile(path.join(ROOT, 'client', 'tauri', 'tauri-shell.js'), path.join(OUT, 'tauri-shell.js'));
 copyTree(path.join(ROOT, 'pages'), path.join(OUT, 'pages'));
 copyTree(path.join(ROOT, 'src'), path.join(OUT, 'src'));

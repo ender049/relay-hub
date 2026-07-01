@@ -1,4 +1,16 @@
 const frame = document.getElementById('app');
+const HOST_CAPABILITIES = {
+  platform: 'electron',
+  nativeFetch: true,
+  openSidePanel: false,
+  siteLogin: false,
+  siteTokenRead: false,
+  browserFetch: false,
+  browserFetchContext: '',
+  loginAutofill: false,
+  loginTargetName: '登录页',
+  tokenSourceName: '登录页'
+};
 
 function sendToApp(message) {
   if (frame && frame.contentWindow) frame.contentWindow.postMessage(message, '*');
@@ -14,9 +26,14 @@ async function sendOpenMode() {
   sendToApp({ type: 'RELAY_OPEN_MODE_DATA', mode });
 }
 
+function sendCapabilities() {
+  sendToApp({ type: 'RELAY_HOST_CAPABILITIES', capabilities: HOST_CAPABILITIES });
+}
+
 function sendInitialData() {
   sendStore();
   sendOpenMode();
+  sendCapabilities();
 }
 
 frame.addEventListener('load', sendInitialData);
@@ -42,6 +59,10 @@ window.addEventListener('message', async event => {
   }
   if (msg && msg.type === 'RELAY_OPEN_MODE_GET') {
     await sendOpenMode();
+    return;
+  }
+  if (msg && msg.type === 'RELAY_HOST_CAPABILITIES_GET') {
+    sendCapabilities();
     return;
   }
   if (msg && msg.type === 'RELAY_OPEN_MODE_SET') {

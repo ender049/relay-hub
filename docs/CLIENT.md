@@ -77,24 +77,30 @@ onStoreData / onOpenModeData
 | 剪贴板 | shell Clipboard API | Electron clipboard；Tauri clipboard-manager |
 | 外链打开 | `src/shell.js` -> 浏览器窗口 | Electron shell.openExternal；Tauri opener |
 | 侧边栏 | Chrome sidePanel | 客户端单窗口布局 |
-| 读取浏览器标签 token / 登录窗口 token | Chrome tabs + scripting | Tauri 内置登录窗口；Electron 当前返回明确占位提示 |
+| 读取站点 token | Chrome tabs + scripting | Tauri 内置登录窗口；Electron 当前通过能力声明关闭入口 |
 
 ## 渠道认证策略
 
-客户端版默认策略：
+默认策略：
 
 1. 用户填写渠道站点、用户名和密码。
-2. 客户端优先走后台自动登录。
-3. 遇到 Turnstile 或登录接口拦截时，用户在渠道表单点击“打开登录窗口”。
-4. Tauri 打开独立 WebView 登录窗口，并尝试代填当前渠道的用户名和密码。
+2. 共享应用层优先走后台自动登录。
+3. 遇到 Turnstile 或登录接口拦截时，用户在渠道表单点击“打开登录页”。
+4. 支持该能力的宿主打开真实登录页，并尝试代填当前渠道的用户名和密码。
 5. 用户手动完成 Turnstile 和登录提交。
-6. 回到主窗口点击“读取令牌”。
-7. Tauri 从登录窗口读取 localStorage、sessionStorage 和 cookie，并回填到当前渠道表单。
+6. 回到 Relay Hub 点击“读取令牌”。
+7. 宿主从登录页上下文读取 localStorage、sessionStorage 和 cookie，并回填到当前渠道表单。
 8. 手动 token / 系统访问令牌保留为高级兼容入口。
 
-当前完整登录接管闭环落在 Tauri 客户端。Electron 骨架保留同名宿主接口，返回明确提示。
+浏览器扩展和 Tauri 都通过宿主能力声明开放登录页、读取令牌和浏览器请求模式。浏览器扩展使用同域浏览器标签页，Tauri 使用内置 WebView2 登录窗口。Electron 骨架保留同名宿主接口，并通过能力声明关闭这些入口。
 
-Sub2API 会回填访问令牌和刷新令牌。New API 会回填访问令牌，并尽量通过登录窗口数据或 `/api/user/self` 补齐 `New-Api-User` 数字用户 ID；若站点没有暴露用户 ID，需要手动填写。
+Sub2API 会回填访问令牌和刷新令牌。New API 会回填访问令牌，并尽量通过登录页数据或 `/api/user/self` 补齐 `New-Api-User` 数字用户 ID；若站点没有暴露用户 ID，需要手动填写。
+
+## 浏览器请求模式
+
+渠道表单提供统一的“浏览器请求模式”开关，配置字段为 `browserFetch`。共享应用层会读取宿主声明的 `browserFetch` 能力：能力开启时，该渠道的同步、兑换和密钥管理请求从第一条请求开始复用宿主浏览器上下文；能力关闭时，配置保留在渠道中，当前宿主继续使用常规请求路径。
+
+浏览器扩展的执行器是同域已登录标签页，通过 `chrome.scripting.executeScript` 在页面内执行 `window.fetch()`。Tauri 的执行器是已登录 WebView2 登录窗口。Electron 当前声明 `browserFetch: false`。这个模式用于 Cloudflare Managed Challenge 保护 API 路径的站点。
 
 ## 运行
 

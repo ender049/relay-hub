@@ -9,6 +9,16 @@ const STORE_FILE = 'store.json';
 let mainWindow = null;
 let storeCache = null;
 
+const hasSingleInstanceLock = app.requestSingleInstanceLock();
+if (!hasSingleInstanceLock) app.quit();
+
+app.on('second-instance', () => {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+});
+
 function storePath() {
   return path.join(app.getPath('userData'), STORE_FILE);
 }
@@ -128,6 +138,9 @@ async function handleDesktopFetch(payload = {}) {
     if (!payload.url) throw new Error('Missing request URL');
     const parsed = new URL(payload.url);
     const kind = payload.kind || 'channel';
+    if (kind === 'channel' && payload.browserFetch === true) {
+      throw new Error('Electron 客户端暂未接入浏览器请求模式，请使用浏览器扩展或 Tauri 客户端。');
+    }
     const headers = sanitizeHeaders(payload.headers || {});
     if (kind === 'channel') {
       setDefaultHeader(headers, 'Accept', 'application/json, text/plain, */*');
@@ -188,15 +201,17 @@ function registerIpc() {
   ipcMain.handle('relay-open-external', (_event, url) => shell.openExternal(String(url || '')));
 }
 
-app.whenReady().then(async () => {
-  await readStoreFile();
-  registerIpc();
-  createWindow();
-  app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+if (hasSingleInstanceLock) {
+  app.whenReady().then(async () => {
+    await readStoreFile();
+    registerIpc();
+    createWindow();
+    app.on('activate', () => {
+      if (BrowserWindow.getAllWindows().length === 0) createWindow();
+    });
   });
-});
 
-app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') app.quit();
-});
+  app.on('window-all-closed', () => {
+    if (process.platform !== 'darwin') app.quit();
+  });
+}
