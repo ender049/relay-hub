@@ -245,7 +245,7 @@ fn apply_main_window_state(window: &tauri::WebviewWindow, store: &Map<String, Va
 }
 
 fn save_main_window_state(app: &AppHandle, window: &tauri::WebviewWindow) {
-    if window.is_minimized().unwrap_or(false) {
+    if window.is_minimized().unwrap_or(false) || !window.is_visible().unwrap_or(true) {
         return;
     }
 
@@ -274,7 +274,11 @@ fn save_main_window_state(app: &AppHandle, window: &tauri::WebviewWindow) {
         }
     }
 
-    store.insert(WINDOW_STATE_KEY.to_string(), Value::Object(window_state));
+    let next = Value::Object(window_state);
+    if store.get(WINDOW_STATE_KEY) == Some(&next) {
+        return;
+    }
+    store.insert(WINDOW_STATE_KEY.to_string(), next);
     let _ = save_store(app, &store);
 }
 
@@ -303,7 +307,7 @@ fn start_minimize_watcher(app: AppHandle) {
         let Some(window) = app.get_webview_window("main") else { continue };
         match window.is_minimized() {
             Ok(true) => hide_main_window(&app),
-            Ok(false) => {}
+            Ok(false) => save_main_window_state(&app, &window),
             Err(_) => break,
         }
     });
@@ -1273,7 +1277,8 @@ pub fn run() {
                 window.on_window_event(move |event| match event {
                     WindowEvent::Moved(_)
                     | WindowEvent::Resized(_)
-                    | WindowEvent::ScaleFactorChanged { .. } => {
+                    | WindowEvent::ScaleFactorChanged { .. }
+                    | WindowEvent::Focused(false) => {
                         save_main_window_state(&app_handle, &event_window);
                     }
                     WindowEvent::CloseRequested { api, .. } => {
@@ -1298,6 +1303,13 @@ pub fn run() {
             relay_read_site_tokens,
             relay_fetch,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Relay Hub Tauri app");
+        .build(tauri::generate_context!())
+        .expect("error while building Relay Hub Tauri app")
+        .run(|app, event| {
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                if let Some(window) = app.get_webview_window("main") {
+                    save_main_window_state(app, &window);
+                }
+            }
+        });
 }

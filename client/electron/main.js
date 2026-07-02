@@ -27,6 +27,8 @@ app.on('second-instance', () => {
   mainWindow.focus();
 });
 
+app.on('before-quit', () => saveWindowStateSync());
+
 function storePath() {
   return path.join(app.getPath('userData'), STORE_FILE);
 }
