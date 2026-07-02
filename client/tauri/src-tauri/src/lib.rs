@@ -24,6 +24,7 @@ const MAX_WINDOW_DIMENSION: u32 = 10000;
 const MIN_VISIBLE_SIZE: i32 = 80;
 const LOGIN_WINDOW_LABEL: &str = "channel-login";
 static BROWSER_FETCH_SEQ: AtomicU64 = AtomicU64::new(1);
+static WINDOW_STATE_SAVE_SEQ: AtomicU64 = AtomicU64::new(1);
 
 struct AppState {
     store: Mutex<Map<String, Value>>,
@@ -282,6 +283,17 @@ fn save_main_window_state(app: &AppHandle, window: &tauri::WebviewWindow) {
     let _ = save_store(app, &store);
 }
 
+fn schedule_main_window_state_save(app: AppHandle, window: tauri::WebviewWindow) {
+    let seq = WINDOW_STATE_SAVE_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(350));
+        if WINDOW_STATE_SAVE_SEQ.load(Ordering::Relaxed) != seq {
+            return;
+        }
+        save_main_window_state(&app, &window);
+    });
+}
+
 fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
@@ -307,7 +319,7 @@ fn start_minimize_watcher(app: AppHandle) {
         let Some(window) = app.get_webview_window("main") else { continue };
         match window.is_minimized() {
             Ok(true) => hide_main_window(&app),
-            Ok(false) => save_main_window_state(&app, &window),
+            Ok(false) => {}
             Err(_) => break,
         }
     });
@@ -1279,7 +1291,7 @@ pub fn run() {
                     | WindowEvent::Resized(_)
                     | WindowEvent::ScaleFactorChanged { .. }
                     | WindowEvent::Focused(false) => {
-                        save_main_window_state(&app_handle, &event_window);
+                        schedule_main_window_state_save(app_handle.clone(), event_window.clone());
                     }
                     WindowEvent::CloseRequested { api, .. } => {
                         api.prevent_close();
