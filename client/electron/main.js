@@ -1,13 +1,21 @@
-const { app, BrowserWindow, ipcMain, shell, clipboard } = require('electron');
+const { app, BrowserWindow, ipcMain, shell, clipboard, screen } = require('electron');
+const fsSync = require('fs');
 const fs = require('fs/promises');
 const path = require('path');
 
 const STORE_KEYS = ['apm_s', 'apm_ch', 'apm_tab', 'apm_font', 'relay_theme', 'apm_ar'];
 const OPEN_MODE_KEY = 'relay_open_mode';
+const WINDOW_STATE_KEY = 'relay_window_state';
 const STORE_FILE = 'store.json';
+const DEFAULT_WINDOW_BOUNDS = { width: 1120, height: 780 };
+const MIN_WINDOW_WIDTH = 720;
+const MIN_WINDOW_HEIGHT = 520;
+const MAX_WINDOW_DIMENSION = 10000;
+const MIN_VISIBLE_SIZE = 80;
 
 let mainWindow = null;
 let storeCache = null;
+let windowStateSaveTimer = null;
 
 const hasSingleInstanceLock = app.requestSingleInstanceLock();
 if (!hasSingleInstanceLock) app.quit();
@@ -39,6 +47,12 @@ async function writeStoreFile(next) {
   storeCache = next && typeof next === 'object' ? next : {};
   await fs.mkdir(path.dirname(storePath()), { recursive: true });
   await fs.writeFile(storePath(), JSON.stringify(storeCache, null, 2));
+}
+
+function writeStoreFileSync(next) {
+  storeCache = next && typeof next === 'object' ? next : {};
+  fsSync.mkdirSync(path.dirname(storePath()), { recursive: true });
+  fsSync.writeFileSync(storePath(), JSON.stringify(storeCache, null, 2));
 }
 
 async function readAppStore() {
@@ -80,14 +94,100 @@ async function sendOpenModeToWindow() {
   mainWindow.webContents.send('relay-open-mode-data', await readOpenMode());
 }
 
+function normalizedDimension(value, fallback, min) {
+  const number = Math.round(Number(value));
+  if (!Number.isFinite(number)) return fallback;
+  return Math.min(MAX_WINDOW_DIMENSION, Math.max(min, number));
+}
+
+function normalizedCoordinate(value) {
+  const number = Math.round(Number(value));
+  return Number.isFinite(number) ? number : null;
+}
+
+function getOverlapSize(startA, sizeA, startB, sizeB) {
+  return Math.max(0, Math.min(startA + sizeA, startB + sizeB) - Math.max(startA, startB));
+}
+
+function hasVisibleWindowArea(bounds) {
+  const minVisible = Math.min(MIN_VISIBLE_SIZE, bounds.width, bounds.height);
+  return screen.getAllDisplays().some(display => {
+    const area = display.workArea;
+    const xOverlap = getOverlapSize(bounds.x, bounds.width, area.x, area.width);
+    const yOverlap = getOverlapSize(bounds.y, bounds.height, area.y, area.height);
+    return xOverlap >= minVisible && yOverlap >= minVisible;
+  });
+}
+
+function readWindowState() {
+  const state = storeCache && typeof storeCache[WINDOW_STATE_KEY] === 'object' ? storeCache[WINDOW_STATE_KEY] : {};
+  const bounds = {
+    width: normalizedDimension(state.width, DEFAULT_WINDOW_BOUNDS.width, MIN_WINDOW_WIDTH),
+    height: normalizedDimension(state.height, DEFAULT_WINDOW_BOUNDS.height, MIN_WINDOW_HEIGHT)
+  };
+  const x = normalizedCoordinate(state.x);
+  const y = normalizedCoordinate(state.y);
+  if (x !== null && y !== null && hasVisibleWindowArea({ ...bounds, x, y })) {
+    bounds.x = x;
+    bounds.y = y;
+  }
+  return { bounds, maximized: state.maximized === true };
+}
+
+function collectWindowState(window) {
+  if (!window || window.isDestroyed() || window.isMinimized()) return null;
+  const bounds = window.isMaximized() ? window.getNormalBounds() : window.getBounds();
+  return {
+    x: bounds.x,
+    y: bounds.y,
+    width: normalizedDimension(bounds.width, DEFAULT_WINDOW_BOUNDS.width, MIN_WINDOW_WIDTH),
+    height: normalizedDimension(bounds.height, DEFAULT_WINDOW_BOUNDS.height, MIN_WINDOW_HEIGHT),
+    maximized: window.isMaximized()
+  };
+}
+
+async function saveWindowState(window = mainWindow) {
+  const state = collectWindowState(window);
+  if (!state) return;
+  const raw = await readStoreFile();
+  raw[WINDOW_STATE_KEY] = state;
+  await writeStoreFile(raw);
+}
+
+function saveWindowStateSync(window = mainWindow) {
+  const state = collectWindowState(window);
+  if (!state) return;
+  const raw = storeCache && typeof storeCache === 'object' ? storeCache : {};
+  raw[WINDOW_STATE_KEY] = state;
+  writeStoreFileSync(raw);
+}
+
+function scheduleWindowStateSave(window = mainWindow) {
+  if (windowStateSaveTimer) clearTimeout(windowStateSaveTimer);
+  windowStateSaveTimer = setTimeout(() => {
+    windowStateSaveTimer = null;
+    saveWindowState(window).catch(() => {});
+  }, 300);
+}
+
+function watchWindowState(window) {
+  const scheduleSave = () => scheduleWindowStateSave(window);
+  window.on('resize', scheduleSave);
+  window.on('move', scheduleSave);
+  window.on('maximize', scheduleSave);
+  window.on('unmaximize', scheduleSave);
+  window.on('close', () => saveWindowStateSync(window));
+}
+
 function createWindow() {
+  const savedWindowState = readWindowState();
   mainWindow = new BrowserWindow({
-    width: 1120,
-    height: 780,
+    ...savedWindowState.bounds,
     minWidth: 720,
     minHeight: 520,
     title: 'Relay Hub',
     backgroundColor: '#0f172a',
+    show: false,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -96,6 +196,8 @@ function createWindow() {
     }
   });
 
+  if (savedWindowState.maximized) mainWindow.maximize();
+  watchWindowState(mainWindow);
   mainWindow.loadFile(path.join(__dirname, 'index.html'));
   mainWindow.once('ready-to-show', () => mainWindow.show());
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {

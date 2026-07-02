@@ -1,19 +1,27 @@
 use base64::{engine::general_purpose, Engine as _};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use std::{collections::HashSet, fs, path::PathBuf, sync::{atomic::{AtomicU64, Ordering}, mpsc, Mutex}, thread, time::{Duration, Instant}};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent,
+    AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, State, WebviewUrl,
+    WebviewWindowBuilder, WindowEvent,
 };
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use url::Url;
 
 const STORE_KEYS: &[&str] = &["apm_s", "apm_ch", "apm_tab", "apm_font", "relay_theme", "apm_ar"];
 const OPEN_MODE_KEY: &str = "relay_open_mode";
+const WINDOW_STATE_KEY: &str = "relay_window_state";
 const LEGACY_IDENTIFIER: &str = "works.earendil.relayhub";
+const DEFAULT_MAIN_WINDOW_WIDTH: u32 = 420;
+const DEFAULT_MAIN_WINDOW_HEIGHT: u32 = 720;
+const MIN_MAIN_WINDOW_WIDTH: u32 = 360;
+const MIN_MAIN_WINDOW_HEIGHT: u32 = 520;
+const MAX_WINDOW_DIMENSION: u32 = 10000;
+const MIN_VISIBLE_SIZE: i32 = 80;
 const LOGIN_WINDOW_LABEL: &str = "channel-login";
 static BROWSER_FETCH_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -58,6 +66,15 @@ struct HostResponse {
     ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct WindowState {
+    x: Option<i32>,
+    y: Option<i32>,
+    width: u32,
+    height: u32,
+    maximized: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -153,6 +170,114 @@ fn emit_store(app: &AppHandle, store: &Map<String, Value>) {
     let _ = app.emit("relay-store-data", public_store(store));
 }
 
+fn window_state_u32(value: Option<&Value>, fallback: u32, min: u32) -> u32 {
+    let Some(raw) = value.and_then(Value::as_u64) else {
+        return fallback;
+    };
+    let Ok(number) = u32::try_from(raw) else {
+        return fallback;
+    };
+    number.clamp(min, MAX_WINDOW_DIMENSION)
+}
+
+fn window_state_i32(value: Option<&Value>) -> Option<i32> {
+    value.and_then(Value::as_i64).and_then(|number| i32::try_from(number).ok())
+}
+
+fn saved_window_state(store: &Map<String, Value>) -> Option<WindowState> {
+    let state = store.get(WINDOW_STATE_KEY).and_then(Value::as_object)?;
+    Some(WindowState {
+        x: window_state_i32(state.get("x")),
+        y: window_state_i32(state.get("y")),
+        width: window_state_u32(
+            state.get("width"),
+            DEFAULT_MAIN_WINDOW_WIDTH,
+            MIN_MAIN_WINDOW_WIDTH,
+        ),
+        height: window_state_u32(
+            state.get("height"),
+            DEFAULT_MAIN_WINDOW_HEIGHT,
+            MIN_MAIN_WINDOW_HEIGHT,
+        ),
+        maximized: state.get("maximized").and_then(Value::as_bool).unwrap_or(false),
+    })
+}
+
+fn overlap_size(start_a: i32, size_a: u32, start_b: i32, size_b: u32) -> i32 {
+    let end_a = start_a.saturating_add(size_a as i32);
+    let end_b = start_b.saturating_add(size_b as i32);
+    end_a.min(end_b).saturating_sub(start_a.max(start_b)).max(0)
+}
+
+fn has_visible_window_area(
+    window: &tauri::WebviewWindow,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+) -> bool {
+    let Ok(monitors) = window.available_monitors() else {
+        return true;
+    };
+    if monitors.is_empty() {
+        return true;
+    }
+    let min_visible = MIN_VISIBLE_SIZE.min(width as i32).min(height as i32);
+    monitors.iter().any(|monitor| {
+        let area = monitor.work_area();
+        let x_overlap = overlap_size(x, width, area.position.x, area.size.width);
+        let y_overlap = overlap_size(y, height, area.position.y, area.size.height);
+        x_overlap >= min_visible && y_overlap >= min_visible
+    })
+}
+
+fn apply_main_window_state(window: &tauri::WebviewWindow, store: &Map<String, Value>) {
+    let Some(state) = saved_window_state(store) else { return };
+    let _ = window.set_size(PhysicalSize::new(state.width, state.height));
+    if let (Some(x), Some(y)) = (state.x, state.y) {
+        if has_visible_window_area(window, x, y, state.width, state.height) {
+            let _ = window.set_position(PhysicalPosition::new(x, y));
+        }
+    }
+    if state.maximized {
+        let _ = window.maximize();
+    }
+}
+
+fn save_main_window_state(app: &AppHandle, window: &tauri::WebviewWindow) {
+    if window.is_minimized().unwrap_or(false) {
+        return;
+    }
+
+    let maximized = window.is_maximized().unwrap_or(false);
+    let state = app.state::<AppState>();
+    let mut store = state.store.lock().expect("store mutex poisoned");
+    let mut window_state = store
+        .get(WINDOW_STATE_KEY)
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    window_state.insert("maximized".to_string(), Value::Bool(maximized));
+
+    if !maximized {
+        if let (Ok(position), Ok(size)) = (window.outer_position(), window.outer_size()) {
+            window_state.insert("x".to_string(), json!(position.x));
+            window_state.insert("y".to_string(), json!(position.y));
+            window_state.insert(
+                "width".to_string(),
+                json!(size.width.clamp(MIN_MAIN_WINDOW_WIDTH, MAX_WINDOW_DIMENSION)),
+            );
+            window_state.insert(
+                "height".to_string(),
+                json!(size.height.clamp(MIN_MAIN_WINDOW_HEIGHT, MAX_WINDOW_DIMENSION)),
+            );
+        }
+    }
+
+    store.insert(WINDOW_STATE_KEY.to_string(), Value::Object(window_state));
+    let _ = save_store(app, &store);
+}
+
 fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
@@ -165,6 +290,7 @@ fn show_main_window(app: &AppHandle) {
 
 fn hide_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
+        save_main_window_state(app, &window);
         #[cfg(windows)]
         let _ = window.set_skip_taskbar(true);
         let _ = window.hide();
@@ -195,7 +321,12 @@ fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id().as_ref() {
             "open" => show_main_window(app),
-            "quit" => app.exit(0),
+            "quit" => {
+                if let Some(window) = app.get_webview_window("main") {
+                    save_main_window_state(app, &window);
+                }
+                app.exit(0);
+            }
             _ => {}
         })
         .on_tray_icon_event(move |_tray, event| {
@@ -1127,24 +1258,32 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             setup_tray(app)?;
-            if let Some(window) = app.get_webview_window("main") {
-                let app_handle = app.handle().clone();
-                window.on_window_event(move |event| {
-                    if let WindowEvent::CloseRequested { api, .. } = event {
-                        api.prevent_close();
-                        hide_main_window(&app_handle);
-                    }
-                });
-            }
-            start_minimize_watcher(app.handle().clone());
             let store = load_store(&app.handle());
             app.manage(AppState {
-                store: Mutex::new(store),
+                store: Mutex::new(store.clone()),
                 client: reqwest::Client::builder()
                     .cookie_store(true)
                     .build()
                     .map_err(|err| Box::<dyn std::error::Error>::from(err))?,
             });
+            if let Some(window) = app.get_webview_window("main") {
+                apply_main_window_state(&window, &store);
+                let event_window = window.clone();
+                let app_handle = app.handle().clone();
+                window.on_window_event(move |event| match event {
+                    WindowEvent::Moved(_)
+                    | WindowEvent::Resized(_)
+                    | WindowEvent::ScaleFactorChanged { .. } => {
+                        save_main_window_state(&app_handle, &event_window);
+                    }
+                    WindowEvent::CloseRequested { api, .. } => {
+                        api.prevent_close();
+                        hide_main_window(&app_handle);
+                    }
+                    _ => {}
+                });
+            }
+            start_minimize_watcher(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
