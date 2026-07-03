@@ -2,7 +2,8 @@ let servers=[],channels=[],mainTab='pool',quotaCache={},loadingFiles=new Set(),c
 const host=window.RelayHost;
 const inShell=!!host?.hasHost;
 const inExtensionPage=!!host?.inExtensionPage;
-let hostCaps=host.capabilities?host.capabilities():{},shellStoreReady=false;
+let hostCaps=host.capabilities?host.capabilities():{},shellStoreReady=false,shellInitRetryTimer=null,shellInitRetryAttempt=0;
+const SHELL_INIT_RETRY_DELAYS=[0,80,200,500,1000,1600,2500,4000];
 function hostCapsReady(){return !inShell||hostCaps.ready===true}
 function hostCap(k){return !!hostCaps[k]}
 function hostCapText(k,d=''){return hostCaps[k]==null?d:String(hostCaps[k])}
@@ -12,6 +13,8 @@ function stSet(k,v){host.setStore(k,v)}
 function requestShellStore(){host.requestStore()}
 function requestOpenMode(){host.requestOpenMode()}
 function requestCapabilities(){host.requestCapabilities?.()}
+function stopShellInitRequests(){if(shellInitRetryTimer){clearTimeout(shellInitRetryTimer);shellInitRetryTimer=null}}
+function scheduleShellInitRequests(){if(!inShell||appBooted||shellInitRetryTimer)return;const delay=SHELL_INIT_RETRY_DELAYS[Math.min(shellInitRetryAttempt,SHELL_INIT_RETRY_DELAYS.length-1)];shellInitRetryTimer=setTimeout(()=>{shellInitRetryTimer=null;if(!inShell||appBooted)return;shellInitRetryAttempt++;requestCapabilities();requestShellStore();requestOpenMode();scheduleShellInitRequests()},delay)}
 function syncOpenModeUI(){const el=document.getElementById('openModeSidepanel');if(el)el.checked=openMode==='sidepanel';const tx=document.getElementById('openModeText');if(tx)tx.textContent='侧边栏模式'}
 function setOpenMode(mode){openMode=mode==='sidepanel'?'sidepanel':'popup';syncOpenModeUI();host.setOpenMode(openMode)}
 function toggleOpenMode(checked){setOpenMode(checked?'sidepanel':'popup');showToast(checked?'点击扩展图标将打开侧边栏':'点击扩展图标将打开弹窗')}
@@ -105,8 +108,8 @@ function updateCountdown(){['arBtnText'].forEach(id=>{const btn=document.getElem
 function setRefreshBusy(){['arBtnText'].forEach(id=>{const btn=document.getElementById(id);if(btn)btn.innerHTML='<span class="ld" style="width:14px;height:14px;border-width:2px"></span>'})}
 function manualRefresh(){clearInterval(autoRefreshCountdownTimer);autoRefreshCountdownTimer=null;setRefreshBusy();connectAll().finally(()=>{autoRefreshCountdown=autoRefreshSec;updateCountdown();if(autoRefreshSec>0)startArCountdown()})}
 
-document.addEventListener('DOMContentLoaded',()=>{new MutationObserver(scheduleIconize).observe(document.body,{childList:true,subtree:true});document.addEventListener('click',()=>{document.querySelectorAll('.srv-menu').forEach(x=>x.classList.add('hidden'));srvMenuId=null;chMenuId=null;hideHdrMenu()});if(inShell){renderHdr();requestCapabilities();requestShellStore();requestOpenMode();return}bootApp()});
-function bootApp(){if(appBooted)return;appBooted=true;load();loadQC();mainTab=stGet('apm_tab')||'pool';const fs=stGet('apm_font')||'md';document.body.className='font-size-'+fs;applyTheme(stGet('relay_theme')||'light');const ar=stGet('apm_ar')||'60';syncAutoRefreshControls(ar);firstLoad=true;renderCur();if((parseInt(ar)||0)>0){connectAll(null,{autoOnly:true}).then(()=>setAutoRefresh(ar)).catch(e=>{setAutoRefresh(ar);showToast('加载失败: '+(e.message||e))})}else{firstLoad=false;setAutoRefresh(ar);renderData()}}
+document.addEventListener('DOMContentLoaded',()=>{new MutationObserver(scheduleIconize).observe(document.body,{childList:true,subtree:true});document.addEventListener('click',()=>{document.querySelectorAll('.srv-menu').forEach(x=>x.classList.add('hidden'));srvMenuId=null;chMenuId=null;hideHdrMenu()});if(inShell){renderHdr();scheduleShellInitRequests();return}bootApp()});
+function bootApp(){if(appBooted)return;appBooted=true;stopShellInitRequests();load();loadQC();mainTab=stGet('apm_tab')||'pool';const fs=stGet('apm_font')||'md';document.body.className='font-size-'+fs;applyTheme(stGet('relay_theme')||'light');const ar=stGet('apm_ar')||'60';syncAutoRefreshControls(ar);firstLoad=true;renderCur();if((parseInt(ar)||0)>0){connectAll(null,{autoOnly:true}).then(()=>setAutoRefresh(ar)).catch(e=>{setAutoRefresh(ar);showToast('加载失败: '+(e.message||e))})}else{firstLoad=false;setAutoRefresh(ar);renderData()}}
 function chAutoEnabled(c){return c?.autoRefresh!==false}
 async function connectAll(scope,opt={}){if(connectAllPromise)return connectAllPromise;connectAllPromise=(async()=>{const jobs=[];if(!scope||scope==='cpa')jobs.push(...servers.map(s=>connectSrv(s)));if(!scope||scope==='channel')jobs.push(...channels.map(c=>refreshChannel(c.id,opt)));await Promise.allSettled(jobs);firstLoad=false;refreshing.clear();chRefreshing.clear();renderData()})().finally(()=>{connectAllPromise=null});return connectAllPromise}
 async function connectSrv(srv){if(srvConnecting.has(srv.id))return;srvConnecting.add(srv.id);srv.url=normCpaUrl(srv.url);try{const u=cpaUrl(srv,'/auth-files',{_ts:Date.now()}),r=await cpaHttp(u,{headers:{'Authorization':cpaAuth(srv),'Cache-Control':'no-cache','Pragma':'no-cache'}}),d=cpaJson(r);srv.files=d.files||[];srv.status='online';srv.error=null}catch(e){srv.status='offline';srv.files=[];srv.error=e.message||String(e)}finally{srvConnecting.delete(srv.id)}}

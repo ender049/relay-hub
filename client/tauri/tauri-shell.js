@@ -1,6 +1,8 @@
 const frame = document.getElementById('app');
 const invoke = window.__TAURI__.core.invoke;
 const listen = window.__TAURI__.event.listen;
+const INITIAL_DATA_RETRY_DELAYS = [0, 60, 180, 400, 800, 1400, 2200];
+let initialDataTimers = [];
 const HOST_CAPABILITIES = {
   platform: 'tauri',
   nativeFetch: true,
@@ -38,8 +40,18 @@ function sendInitialData() {
   sendCapabilities();
 }
 
-frame.addEventListener('load', sendInitialData);
-setTimeout(sendInitialData, 0);
+function clearInitialDataTimers() {
+  initialDataTimers.forEach(timer => clearTimeout(timer));
+  initialDataTimers = [];
+}
+
+function scheduleInitialData() {
+  clearInitialDataTimers();
+  initialDataTimers = INITIAL_DATA_RETRY_DELAYS.map(delay => setTimeout(sendInitialData, delay));
+}
+
+frame.addEventListener('load', scheduleInitialData);
+scheduleInitialData();
 
 listen('relay-store-data', event => {
   sendToApp({ type: 'RELAY_STORE_DATA', data: event.payload || {} });

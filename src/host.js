@@ -2,6 +2,7 @@
 const STORE_KEYS=['apm_s','apm_ch','apm_tab','apm_font','relay_theme','apm_ar'];
 const memStore={};
 let storeSig='';
+let storeReceived=false,openModeReceived=false,openModeValue=null;
 const pendingFetch={};
 const pendingCopy=[];
 const pendingSidePanel=[];
@@ -14,6 +15,8 @@ let hostCapabilities={...defaultCapabilities};
 const listeners={store:[],openMode:[],capabilities:[]};
 function hasMem(k){return Object.prototype.hasOwnProperty.call(memStore,k)}
 function curStoreSig(){return STORE_KEYS.map(k=>k+'='+(hasMem(k)?memStore[k]:'')).join('\n')}
+function storeSnapshot(){const out={};STORE_KEYS.forEach(k=>{if(hasMem(k))out[k]=memStore[k]});return out}
+function applyStoreData(data){STORE_KEYS.forEach(k=>{if(Object.prototype.hasOwnProperty.call(data,k))memStore[k]=String(data[k]);else delete memStore[k]})}
 function post(message){if(hasHost)window.parent.postMessage(message,'*')}
 function getStore(k){if(hasHost)return hasMem(k)?memStore[k]:null;try{return localStorage.getItem(k)}catch{return hasMem(k)?memStore[k]:null}}
 function setStore(k,v){memStore[k]=String(v);storeSig=curStoreSig();if(hasHost){post({type:'RELAY_STORE_SET',key:k,value:String(v)});return}try{localStorage.setItem(k,v)}catch{}}
@@ -30,9 +33,9 @@ function fetchViaHost(payload){if(!hasHost)return Promise.resolve(null);const id
 function openSiteLogin(payload){if(!hasHost)return Promise.resolve({ok:false,error:'客户端宿主不可用'});return new Promise(resolve=>{pendingSiteLogin.push(resolve);post({type:'RELAY_OPEN_SITE_LOGIN',payload:payload||{}})})}
 function readSiteTokens(siteUrl,siteType){if(!hasHost)return Promise.resolve({ok:false,error:'请从扩展弹窗、侧边栏或客户端读取站点令牌'});return new Promise(resolve=>{pendingSiteTokens.push(resolve);post({type:'RELAY_READ_SITE_TOKENS',siteUrl,siteType})})}
 function openExternal(url){const target=String(url||'');if(!target)return;if(hasHost){post({type:'RELAY_OPEN_EXTERNAL',url:target});return}window.open(target,'_blank','noopener,noreferrer')}
-function onStoreData(fn){listeners.store.push(fn)}
-function onOpenModeData(fn){listeners.openMode.push(fn)}
-function onCapabilitiesData(fn){listeners.capabilities.push(fn)}
-window.addEventListener('message',e=>{const m=e.data;if(!m)return;if(m.type==='RELAY_STORE_DATA'&&m.data){Object.assign(memStore,m.data);const sig=curStoreSig();if(sig===storeSig)return;storeSig=sig;listeners.store.forEach(fn=>fn(m.data,sig));return}if(m.type==='RELAY_OPEN_MODE_DATA'){listeners.openMode.forEach(fn=>fn(m.mode));return}if(m.type==='RELAY_HOST_CAPABILITIES'){hostCapabilities=normalizeCapabilities(m.capabilities||m.data);listeners.capabilities.forEach(fn=>fn(capabilities()));return}if(m.type==='RELAY_COPY_TEXT_RESULT'){const resolve=pendingCopy.shift();if(resolve)resolve({ok:!!m.ok,error:m.error||''});return}if(m.type==='RELAY_OPEN_SIDEPANEL_RESULT'){const resolve=pendingSidePanel.shift();if(resolve)resolve(m.response||{ok:true});return}if(m.type==='RELAY_OPEN_SITE_LOGIN_RESULT'){const resolve=pendingSiteLogin.shift();if(resolve)resolve(m.response||{ok:false,error:'宿主无响应'});return}if(m.type==='RELAY_READ_SITE_TOKENS_RESULT'){const resolve=pendingSiteTokens.shift();if(resolve)resolve(m.response||{ok:false,error:'宿主无响应'});return}if(m.type==='CPA_CHANNEL_FETCH_RESULT'&&m.id&&pendingFetch[m.id]){pendingFetch[m.id](m.response);delete pendingFetch[m.id]}});
+function onStoreData(fn){listeners.store.push(fn);if(storeReceived)fn(storeSnapshot(),storeSig)}
+function onOpenModeData(fn){listeners.openMode.push(fn);if(openModeReceived)fn(openModeValue)}
+function onCapabilitiesData(fn){listeners.capabilities.push(fn);if(hostCapabilities.ready)fn(capabilities())}
+window.addEventListener('message',e=>{const m=e.data;if(!m)return;if(m.type==='RELAY_STORE_DATA'&&m.data&&typeof m.data==='object'){applyStoreData(m.data);const sig=curStoreSig(),changed=!storeReceived||sig!==storeSig;storeSig=sig;storeReceived=true;if(!changed)return;listeners.store.forEach(fn=>fn(storeSnapshot(),sig));return}if(m.type==='RELAY_OPEN_MODE_DATA'){openModeValue=m.mode;openModeReceived=true;listeners.openMode.forEach(fn=>fn(openModeValue));return}if(m.type==='RELAY_HOST_CAPABILITIES'){hostCapabilities=normalizeCapabilities(m.capabilities||m.data);listeners.capabilities.forEach(fn=>fn(capabilities()));return}if(m.type==='RELAY_COPY_TEXT_RESULT'){const resolve=pendingCopy.shift();if(resolve)resolve({ok:!!m.ok,error:m.error||''});return}if(m.type==='RELAY_OPEN_SIDEPANEL_RESULT'){const resolve=pendingSidePanel.shift();if(resolve)resolve(m.response||{ok:true});return}if(m.type==='RELAY_OPEN_SITE_LOGIN_RESULT'){const resolve=pendingSiteLogin.shift();if(resolve)resolve(m.response||{ok:false,error:'宿主无响应'});return}if(m.type==='RELAY_READ_SITE_TOKENS_RESULT'){const resolve=pendingSiteTokens.shift();if(resolve)resolve(m.response||{ok:false,error:'宿主无响应'});return}if(m.type==='CPA_CHANNEL_FETCH_RESULT'&&m.id&&pendingFetch[m.id]){pendingFetch[m.id](m.response);delete pendingFetch[m.id]}});
 window.RelayHost={hasHost,inExtensionPage,getStore,setStore,requestStore,requestOpenMode,requestCapabilities,capabilities,hasCapability,setOpenMode,openSidePanel,copyText,fetch:fetchViaHost,openSiteLogin,readSiteTokens,openExternal,onStoreData,onOpenModeData,onCapabilitiesData,storeSignature:()=>storeSig};
 })();
