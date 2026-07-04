@@ -13,6 +13,7 @@ const artifacts = [
   [path.join(ROOT, 'client', 'tauri', 'src-tauri', 'target', 'x86_64-pc-windows-gnu', 'release', 'relay-hub.exe'), 'relay-hub-tauri-windows-x86_64.exe'],
   [path.join(ROOT, 'client', 'tauri', 'src-tauri', 'target', 'release', 'bundle', 'deb', 'Relay Hub_0.1.0_amd64.deb'), 'relay-hub-tauri_0.1.0_amd64.deb'],
   [path.join(ROOT, 'client', 'tauri', 'src-tauri', 'target', 'release', 'bundle', 'rpm', 'Relay Hub-0.1.0-1.x86_64.rpm'), 'relay-hub-tauri-0.1.0-1.x86_64.rpm'],
+  [path.join(ROOT, 'client', 'tauri', 'src-tauri', 'target', 'release', 'bundle', 'appimage', 'Relay Hub_0.1.0_amd64.AppImage'), 'relay-hub-tauri_0.1.0_amd64.AppImage'],
   [path.join(ROOT, 'client', 'tauri', 'src-tauri', 'target', 'release', 'bundle', 'msi', 'Relay Hub_0.1.0_x64_en-US.msi'), 'relay-hub-tauri_0.1.0_x64.msi'],
   [path.join(ROOT, 'client', 'tauri', 'src-tauri', 'target', 'release', 'bundle', 'nsis', 'Relay Hub_0.1.0_x64-setup.exe'), 'relay-hub-tauri_0.1.0_x64-setup.exe'],
   [path.join(ROOT, 'client', 'tauri', 'src-tauri', 'target', 'release', 'bundle', 'dmg', 'Relay Hub_0.1.0_x64.dmg'), 'relay-hub-tauri_0.1.0_x64.dmg'],
