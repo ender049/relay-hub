@@ -321,11 +321,15 @@ async function handleExtensionFetch(payload) {
       cache: 'no-store'
     };
     if (kind === 'channel') fetchOptions.credentials = 'include';
+    const startedAt = Date.now();
     const res = await fetch(url, fetchOptions);
     const responseHeaders = {};
     res.headers.forEach((value, key) => {
       responseHeaders[key] = value;
     });
+    if (payload.streamTiming === true) {
+      return collectStreamTimingResponse(res, responseHeaders, startedAt);
+    }
     if (payload.responseType === 'base64') {
       const bytes = new Uint8Array(await res.arrayBuffer());
       let binary = '';
@@ -383,7 +387,8 @@ async function runBrowserFetchInTab(tab, payload, parsedUrl, headers) {
       method: payload.method || 'GET',
       headers: { ...(headers || {}) },
       body: payload.body || null,
-      siteType: payload.siteType || ''
+      siteType: payload.siteType || '',
+      streamTiming: payload.streamTiming === true
     }]
   });
   const response = result && result.result ? result.result : { ok: false, status: 0, error: '浏览器请求没有返回结果' };
@@ -455,6 +460,58 @@ async function focusTab(tabId) {
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function collectStreamTimingResponse(res, responseHeaders, startedAt) {
+  if (!res.body || !res.body.getReader) {
+    const body = await res.text();
+    return { ok: res.ok, status: res.status, headers: responseHeaders, body, streamTiming: { firstTokenMs: null, totalMs: Date.now() - startedAt, sample: streamSample(body) } };
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let body = '', firstTokenMs = null, sample = '';
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    const chunk = decoder.decode(value, { stream: true });
+    body += chunk;
+    if (firstTokenMs === null) {
+      const firstSample = streamSample(body);
+      if (firstSample) firstTokenMs = Date.now() - startedAt;
+    }
+  }
+  body += decoder.decode();
+  sample = streamSample(body);
+  return { ok: res.ok, status: res.status, headers: responseHeaders, body, streamTiming: { firstTokenMs, totalMs: Date.now() - startedAt, sample } };
+}
+
+function streamSample(text) {
+  const out = [];
+  String(text || '').split(/\r?\n/).forEach(line => {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('data:')) return;
+    const data = trimmed.slice(5).trim();
+    if (!data || data === '[DONE]') return;
+    try {
+      const json = JSON.parse(data);
+      (json.choices || []).forEach(choice => {
+        const content = choice.delta?.content ?? choice.message?.content ?? choice.text ?? '';
+        if (content) out.push(String(content));
+      });
+    } catch (_) {
+      out.push(data);
+    }
+  });
+  if (!out.length) {
+    try {
+      const json = JSON.parse(String(text || ''));
+      (json.choices || []).forEach(choice => {
+        const content = choice.message?.content ?? choice.delta?.content ?? choice.text ?? '';
+        if (content) out.push(String(content));
+      });
+    } catch (_) {}
+  }
+  return out.join('').slice(0, 240);
 }
 
 async function browserFetchInPage(payload) {
@@ -563,6 +620,7 @@ async function browserFetchInPage(payload) {
     const timer = controller ? setTimeout(() => controller.abort(), 25000) : null;
     if (controller) init.signal = controller.signal;
     let res;
+    const startedAt = Date.now();
     try {
       res = await fetch(payload.url, init);
     } catch (err) {
@@ -575,6 +633,46 @@ async function browserFetchInPage(payload) {
     res.headers.forEach((value, key) => {
       responseHeaders[key] = value;
     });
+    if (payload.streamTiming === true) {
+      const streamSample = text => {
+        const out = [];
+        String(text || '').split(/\r?\n/).forEach(line => {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith('data:')) return;
+          const data = trimmed.slice(5).trim();
+          if (!data || data === '[DONE]') return;
+          try {
+            const json = JSON.parse(data);
+            (json.choices || []).forEach(choice => {
+              const content = choice.delta?.content ?? choice.message?.content ?? choice.text ?? '';
+              if (content) out.push(String(content));
+            });
+          } catch (_) {
+            out.push(data);
+          }
+        });
+        return out.join('').slice(0, 240);
+      };
+      if (!res.body || !res.body.getReader) {
+        const body = await res.text();
+        return { ok: res.ok, status: res.status, headers: responseHeaders, body, streamTiming: { firstTokenMs: null, totalMs: Date.now() - startedAt, sample: streamSample(body) } };
+      }
+      const reader = res.body.getReader(), decoder = new TextDecoder();
+      let body = '', firstTokenMs = null, sample = '';
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        const chunk = decoder.decode(value, { stream: true });
+        body += chunk;
+        if (firstTokenMs === null) {
+          const firstSample = streamSample(body);
+          if (firstSample) firstTokenMs = Date.now() - startedAt;
+        }
+      }
+      body += decoder.decode();
+      sample = streamSample(body);
+      return { ok: res.ok, status: res.status, headers: responseHeaders, body, streamTiming: { firstTokenMs, totalMs: Date.now() - startedAt, sample } };
+    }
     return { ok: res.ok, status: res.status, headers: responseHeaders, body: await res.text() };
   } catch (err) {
     return { ok: false, status: 0, headers: {}, body: '', error: err && err.message ? err.message : String(err) };

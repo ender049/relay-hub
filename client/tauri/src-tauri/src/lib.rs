@@ -44,6 +44,8 @@ struct FetchPayload {
     response_type: Option<String>,
     #[serde(rename = "browserFetch")]
     browser_fetch: Option<bool>,
+    #[serde(rename = "streamTiming")]
+    stream_timing: Option<bool>,
     #[serde(rename = "siteUrl")]
     site_url: Option<String>,
     #[serde(rename = "siteType")]
@@ -58,8 +60,19 @@ struct FetchResponse {
     status: u16,
     headers: Map<String, Value>,
     body: String,
+    #[serde(rename = "streamTiming", skip_serializing_if = "Option::is_none")]
+    stream_timing: Option<StreamTiming>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct StreamTiming {
+    #[serde(rename = "firstTokenMs")]
+    first_token_ms: Option<u128>,
+    #[serde(rename = "totalMs")]
+    total_ms: u128,
+    sample: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -454,7 +467,7 @@ async fn relay_read_site_tokens(app: AppHandle, state: State<'_, AppState>, site
 async fn relay_fetch(app: AppHandle, state: State<'_, AppState>, payload: FetchPayload) -> Result<FetchResponse, String> {
     Ok(match do_fetch(&app, &state.client, payload).await {
         Ok(response) => response,
-        Err(error) => FetchResponse { ok: false, status: 0, headers: Map::new(), body: String::new(), error: Some(error) },
+        Err(error) => FetchResponse { ok: false, status: 0, headers: Map::new(), body: String::new(), stream_timing: None, error: Some(error) },
     })
 }
 
@@ -827,12 +840,17 @@ async fn do_fetch(app: &AppHandle, client: &reqwest::Client, payload: FetchPaylo
         request = request.body(body);
     }
 
+    let started_at = Instant::now();
     let res = request.send().await.map_err(|err| err.to_string())?;
     let status = res.status().as_u16();
     let ok = res.status().is_success();
     let mut response_headers = Map::new();
     for (key, value) in res.headers().iter() {
         response_headers.insert(key.to_string(), Value::String(value.to_str().unwrap_or_default().to_string()));
+    }
+
+    if payload.stream_timing == Some(true) {
+        return collect_stream_timing_response(res, status, ok, response_headers, started_at).await;
     }
 
     let bytes = res.bytes().await.map_err(|err| err.to_string())?;
@@ -842,7 +860,69 @@ async fn do_fetch(app: &AppHandle, client: &reqwest::Client, payload: FetchPaylo
         String::from_utf8_lossy(&bytes).to_string()
     };
 
-    Ok(FetchResponse { ok, status, headers: response_headers, body, error: None })
+    Ok(FetchResponse { ok, status, headers: response_headers, body, stream_timing: None, error: None })
+}
+
+async fn collect_stream_timing_response(mut res: reqwest::Response, status: u16, ok: bool, headers: Map<String, Value>, started_at: Instant) -> Result<FetchResponse, String> {
+    let mut body = String::new();
+    let mut first_token_ms = None;
+    while let Some(chunk) = res.chunk().await.map_err(|err| err.to_string())? {
+        let text = String::from_utf8_lossy(&chunk).to_string();
+        body.push_str(&text);
+        if first_token_ms.is_none() {
+            let first_sample = stream_sample(&body);
+            if !first_sample.is_empty() {
+                first_token_ms = Some(started_at.elapsed().as_millis());
+            }
+        }
+    }
+    let sample = stream_sample(&body);
+    Ok(FetchResponse {
+        ok,
+        status,
+        headers,
+        body,
+        stream_timing: Some(StreamTiming { first_token_ms, total_ms: started_at.elapsed().as_millis(), sample }),
+        error: None,
+    })
+}
+
+fn stream_sample(text: &str) -> String {
+    let mut out = String::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("data:") { continue; }
+        let data = trimmed.trim_start_matches("data:").trim();
+        if data.is_empty() || data == "[DONE]" { continue; }
+        if let Ok(value) = serde_json::from_str::<Value>(data) {
+            if let Some(choices) = value.get("choices").and_then(Value::as_array) {
+                for choice in choices {
+                    let content = choice.get("delta").and_then(|v| v.get("content")).and_then(Value::as_str)
+                        .or_else(|| choice.get("message").and_then(|v| v.get("content")).and_then(Value::as_str))
+                        .or_else(|| choice.get("text").and_then(Value::as_str))
+                        .unwrap_or_default();
+                    out.push_str(content);
+                }
+            }
+        } else {
+            out.push_str(data);
+        }
+        if out.len() >= 240 { break; }
+    }
+    if out.is_empty() {
+        if let Ok(value) = serde_json::from_str::<Value>(text) {
+            if let Some(choices) = value.get("choices").and_then(Value::as_array) {
+                for choice in choices {
+                    let content = choice.get("message").and_then(|v| v.get("content")).and_then(Value::as_str)
+                        .or_else(|| choice.get("delta").and_then(|v| v.get("content")).and_then(Value::as_str))
+                        .or_else(|| choice.get("text").and_then(Value::as_str))
+                        .unwrap_or_default();
+                    out.push_str(content);
+                }
+            }
+        }
+    }
+    out.chars().take(240).collect()
 }
 
 async fn do_browser_fetch(app: &AppHandle, url: &Url, payload: FetchPayload) -> Result<FetchResponse, String> {
@@ -968,6 +1048,7 @@ fn browser_fetch_start_script(payload: &FetchPayload, request_id: &str) -> Resul
     let headers = serde_json::to_string(&browser_fetch_headers(payload.headers.as_ref())).map_err(|err| err.to_string())?;
     let body = serde_json::to_string(&payload.body.as_deref()).map_err(|err| err.to_string())?;
     let site_type = serde_json::to_string(payload.site_type.as_deref().unwrap_or_default()).map_err(|err| err.to_string())?;
+    let stream_timing = payload.stream_timing == Some(true);
     let auth_script = browser_fetch_auth_helper_script();
     Ok(format!(r#"(() => {{
   const id = {id};
@@ -993,6 +1074,7 @@ fn browser_fetch_start_script(payload: &FetchPayload, request_id: &str) -> Resul
       const timer = controller ? setTimeout(() => controller.abort(), 25000) : null;
       if (controller) init.signal = controller.signal;
       let res;
+      const startedAt = Date.now();
       try {{
         res = await fetch({url}, init);
       }} catch (err) {{
@@ -1003,6 +1085,49 @@ fn browser_fetch_start_script(payload: &FetchPayload, request_id: &str) -> Resul
       }}
       const responseHeaders = {{}};
       res.headers.forEach((value, key) => {{ responseHeaders[key] = value; }});
+      if ({stream_timing}) {{
+        const streamSample = text => {{
+          const out = [];
+          String(text || '').split(/\r?\n/).forEach(line => {{
+            const trimmed = line.trim();
+            if (!trimmed.startsWith('data:')) return;
+            const data = trimmed.slice(5).trim();
+            if (!data || data === '[DONE]') return;
+            try {{
+              const json = JSON.parse(data);
+              (json.choices || []).forEach(choice => {{
+                const content = choice.delta?.content ?? choice.message?.content ?? choice.text ?? '';
+                if (content) out.push(String(content));
+              }});
+            }} catch (_) {{
+              out.push(data);
+            }}
+          }});
+          return out.join('').slice(0, 240);
+        }};
+        if (!res.body || !res.body.getReader) {{
+          const bodyText = await res.text();
+          store[id] = {{ done: true, result: {{ ok: res.ok, status: res.status, headers: responseHeaders, body: bodyText, streamTiming: {{ firstTokenMs: null, totalMs: Date.now() - startedAt, sample: streamSample(bodyText) }} }} }};
+          return;
+        }}
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let bodyText = '', firstTokenMs = null, sample = '';
+        while (true) {{
+          const {{ value, done }} = await reader.read();
+          if (done) break;
+          const chunk = decoder.decode(value, {{ stream: true }});
+          bodyText += chunk;
+          if (firstTokenMs === null) {{
+            const firstSample = streamSample(bodyText);
+            if (firstSample) firstTokenMs = Date.now() - startedAt;
+          }}
+        }}
+        bodyText += decoder.decode();
+        sample = streamSample(bodyText);
+        store[id] = {{ done: true, result: {{ ok: res.ok, status: res.status, headers: responseHeaders, body: bodyText, streamTiming: {{ firstTokenMs, totalMs: Date.now() - startedAt, sample }} }} }};
+        return;
+      }}
       store[id] = {{ done: true, result: {{ ok: res.ok, status: res.status, headers: responseHeaders, body: await res.text() }} }};
     }} catch (err) {{
       store[id] = {{ done: true, result: {{ ok: false, status: 0, headers: {{}}, body: '', error: err && err.message ? err.message : String(err) }} }};
@@ -1177,6 +1302,7 @@ fn browser_session_expired_response(expected: &Url) -> FetchResponse {
         status: 0,
         headers: Map::new(),
         body: String::new(),
+        stream_timing: None,
         error: Some(format!("BROWSER_SESSION_REVALIDATION_REQUIRED: {} 浏览器会话验证已过期，请在 WebView2 登录窗口完成验证后重试", expected.host_str().unwrap_or_default())),
     }
 }
@@ -1236,6 +1362,7 @@ fn parse_browser_fetch_response(raw: &str) -> Result<FetchResponse, String> {
         status: map.get("status").and_then(Value::as_u64).unwrap_or(0) as u16,
         headers,
         body: map.get("body").and_then(Value::as_str).unwrap_or_default().to_string(),
+        stream_timing: map.get("streamTiming").and_then(|value| serde_json::from_value(value.clone()).ok()),
         error: map.get("error").and_then(Value::as_str).map(str::to_string),
     })
 }

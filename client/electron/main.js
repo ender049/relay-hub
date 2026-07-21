@@ -237,6 +237,58 @@ function base64ToBytes(value) {
   return new Uint8Array(binary.buffer, binary.byteOffset, binary.byteLength);
 }
 
+function streamSample(text) {
+  const out = [];
+  String(text || '').split(/\r?\n/).forEach(line => {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('data:')) return;
+    const data = trimmed.slice(5).trim();
+    if (!data || data === '[DONE]') return;
+    try {
+      const json = JSON.parse(data);
+      (json.choices || []).forEach(choice => {
+        const content = choice.delta?.content ?? choice.message?.content ?? choice.text ?? '';
+        if (content) out.push(String(content));
+      });
+    } catch (_) {
+      out.push(data);
+    }
+  });
+  if (!out.length) {
+    try {
+      const json = JSON.parse(String(text || ''));
+      (json.choices || []).forEach(choice => {
+        const content = choice.message?.content ?? choice.delta?.content ?? choice.text ?? '';
+        if (content) out.push(String(content));
+      });
+    } catch (_) {}
+  }
+  return out.join('').slice(0, 240);
+}
+
+async function collectStreamTimingResponse(res, responseHeaders, startedAt) {
+  if (!res.body || !res.body.getReader) {
+    const body = await res.text();
+    return { ok: res.ok, status: res.status, headers: responseHeaders, body, streamTiming: { firstTokenMs: null, totalMs: Date.now() - startedAt, sample: streamSample(body) } };
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let body = '', firstTokenMs = null, sample = '';
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    const chunk = decoder.decode(value, { stream: true });
+    body += chunk;
+    if (firstTokenMs === null) {
+      const firstSample = streamSample(body);
+      if (firstSample) firstTokenMs = Date.now() - startedAt;
+    }
+  }
+  body += decoder.decode();
+  sample = streamSample(body);
+  return { ok: res.ok, status: res.status, headers: responseHeaders, body, streamTiming: { firstTokenMs, totalMs: Date.now() - startedAt, sample } };
+}
+
 async function handleDesktopFetch(payload = {}) {
   try {
     if (!payload.url) throw new Error('Missing request URL');
@@ -251,6 +303,7 @@ async function handleDesktopFetch(payload = {}) {
       setDefaultHeader(headers, 'Accept-Language', 'zh-CN,zh;q=0.9,en;q=0.8');
     }
     const body = payload.bodyBase64 ? base64ToBytes(payload.bodyBase64) : (payload.body || undefined);
+    const startedAt = Date.now();
     const res = await fetch(parsed.href, {
       method: payload.method || 'GET',
       headers,
@@ -261,6 +314,9 @@ async function handleDesktopFetch(payload = {}) {
     res.headers.forEach((value, key) => {
       responseHeaders[key] = value;
     });
+    if (payload.streamTiming === true) {
+      return collectStreamTimingResponse(res, responseHeaders, startedAt);
+    }
     if (payload.responseType === 'base64') {
       const bytes = Buffer.from(await res.arrayBuffer());
       return { ok: res.ok, status: res.status, headers: responseHeaders, body: bytes.toString('base64') };
