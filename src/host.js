@@ -1,5 +1,5 @@
 (function(){
-const STORE_KEYS=['apm_s','apm_ch','apm_tab','apm_font','relay_theme','apm_ar'];
+const STORE_KEYS=['apm_s','apm_ch','apm_acct','apm_tab','apm_font','relay_theme','apm_ar'];
 const memStore={};
 let storeSig='';
 let storeReceived=false,openModeReceived=false,openModeValue=null;

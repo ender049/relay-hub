@@ -1,7 +1,7 @@
 const frame = document.getElementById('app');
 const shellSideBtn = document.getElementById('shellSideBtn');
 
-const STORE_KEYS = ['apm_s', 'apm_ch', 'apm_tab', 'apm_font', 'relay_theme', 'apm_ar'];
+const STORE_KEYS = ['apm_s', 'apm_ch', 'apm_acct', 'apm_tab', 'apm_font', 'relay_theme', 'apm_ar'];
 const OPEN_MODE_KEY = 'relay_open_mode';
 const HOST_CAPABILITIES = {
   platform: 'extension',

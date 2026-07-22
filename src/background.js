@@ -1,5 +1,6 @@
 const OPEN_MODE_KEY = 'relay_open_mode';
 const POPUP_PATH = 'pages/popup.html';
+let accountCookieFetchChain = Promise.resolve();
 
 applyOpenMode();
 chrome.runtime.onInstalled.addListener(applyOpenMode);
@@ -308,7 +309,7 @@ async function handleExtensionFetch(payload) {
     if (kind === 'channel' && payload.browserFetch === true) {
       return handleBrowserFetch(payload, parsed);
     }
-    const headers = sanitizeHeaders(payload.headers || {});
+    const headers = kind === 'account' ? sanitizeAccountHeaders(payload.headers || {}, parsed) : sanitizeHeaders(payload.headers || {});
     if (kind === 'channel') {
       setDefaultHeader(headers, 'Accept', 'application/json, text/plain, */*');
       setDefaultHeader(headers, 'Accept-Language', 'zh-CN,zh;q=0.9,en;q=0.8');
@@ -321,8 +322,9 @@ async function handleExtensionFetch(payload) {
       cache: 'no-store'
     };
     if (kind === 'channel') fetchOptions.credentials = 'include';
+    if (kind === 'account') fetchOptions.credentials = 'include';
     const startedAt = Date.now();
-    const res = await fetch(url, fetchOptions);
+    const res = kind === 'account' ? await fetchWithAccountCookie(parsed, payload.headers || {}, fetchOptions) : await fetch(url, fetchOptions);
     const responseHeaders = {};
     res.headers.forEach((value, key) => {
       responseHeaders[key] = value;
@@ -696,6 +698,59 @@ const FORBIDDEN_REQUEST_HEADERS = new Set([
 
 function sanitizeHeaders(input) {
   return sanitizeHeadersWithForbidden(input, FORBIDDEN_REQUEST_HEADERS);
+}
+
+function headerValue(headers, name) {
+  const lower = String(name).toLowerCase();
+  for (const [key, value] of Object.entries(headers || {})) {
+    if (String(key).toLowerCase() === lower) return String(value || '');
+  }
+  return '';
+}
+
+function sanitizeAccountHeaders(input, parsedUrl) {
+  const headers = sanitizeHeaders(input);
+  return headers;
+}
+
+function cookieValueFromHeader(cookieHeader, name) {
+  const wanted = String(name).toLowerCase();
+  for (const part of String(cookieHeader || '').split(';')) {
+    const index = part.indexOf('=');
+    if (index <= 0) continue;
+    const key = part.slice(0, index).trim().toLowerCase();
+    if (key === wanted) return part.slice(index + 1).trim();
+  }
+  return '';
+}
+
+function fetchWithAccountCookie(parsedUrl, requestHeaders, fetchOptions) {
+  const run = () => fetchWithAccountCookieLocked(parsedUrl, requestHeaders, fetchOptions);
+  const next = accountCookieFetchChain.catch(() => {}).then(run);
+  accountCookieFetchChain = next.catch(() => {});
+  return next;
+}
+
+async function fetchWithAccountCookieLocked(parsedUrl, requestHeaders, fetchOptions) {
+  if (parsedUrl.protocol !== 'https:' || parsedUrl.hostname !== 'opencode.ai') {
+    return fetch(parsedUrl.href, fetchOptions);
+  }
+  const auth = cookieValueFromHeader(headerValue(requestHeaders, 'Cookie'), 'auth');
+  if (!auth || !chrome.cookies) return fetch(parsedUrl.href, fetchOptions);
+  const details = { url: 'https://opencode.ai/', name: 'auth' };
+  const previous = await chrome.cookies.get(details).catch(() => null);
+  await chrome.cookies.set({ ...details, value: auth, domain: 'opencode.ai', path: '/', secure: true, sameSite: 'no_restriction' });
+  try {
+    return await fetch(parsedUrl.href, fetchOptions);
+  } finally {
+    if (previous) {
+      const restore = { ...details, value: previous.value, domain: previous.domain || 'opencode.ai', path: previous.path || '/', secure: previous.secure !== false, sameSite: previous.sameSite || 'no_restriction' };
+      if (!previous.session && previous.expirationDate) restore.expirationDate = previous.expirationDate;
+      await chrome.cookies.set(restore).catch(() => {});
+    } else {
+      await chrome.cookies.remove(details).catch(() => {});
+    }
+  }
 }
 
 function sanitizeBrowserFetchHeaders(input) {

@@ -12,7 +12,7 @@ use tauri::{
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use url::Url;
 
-const STORE_KEYS: &[&str] = &["apm_s", "apm_ch", "apm_tab", "apm_font", "relay_theme", "apm_ar"];
+const STORE_KEYS: &[&str] = &["apm_s", "apm_ch", "apm_acct", "apm_tab", "apm_font", "relay_theme", "apm_ar"];
 const OPEN_MODE_KEY: &str = "relay_open_mode";
 const WINDOW_STATE_KEY: &str = "relay_window_state";
 const LEGACY_IDENTIFIER: &str = "works.earendil.relayhub";
@@ -823,9 +823,13 @@ async fn do_fetch(app: &AppHandle, client: &reqwest::Client, payload: FetchPaylo
     if payload.browser_fetch == Some(true) && payload.kind.as_deref() == Some("channel") {
         return do_browser_fetch(app, &url, payload).await;
     }
+    let headers = if payload.kind.as_deref() == Some("account") {
+        sanitize_account_headers(payload.headers.as_ref(), &url)
+    } else {
+        sanitize_headers(payload.headers.as_ref())
+    };
     let method = payload.method.unwrap_or_else(|| "GET".to_string()).parse().map_err(|err| format!("invalid method: {err}"))?;
     let mut request = client.request(method, url);
-    let headers = sanitize_headers(payload.headers.as_ref());
     request = request.headers(headers);
 
     if payload.kind.as_deref() == Some("channel") {
@@ -1386,6 +1390,31 @@ fn sanitize_headers(input: Option<&Map<String, Value>>) -> HeaderMap {
             let Some(text) = value.as_str() else { continue };
             if let (Ok(header_name), Ok(header_value)) = (HeaderName::from_bytes(name.as_bytes()), HeaderValue::from_str(text)) {
                 headers.insert(header_name, header_value);
+            }
+        }
+    }
+    headers
+}
+
+fn input_header_value(input: Option<&Map<String, Value>>, name: &str) -> Option<String> {
+    let lower = name.to_ascii_lowercase();
+    input?.iter().find_map(|(key, value)| {
+        if key.to_ascii_lowercase() == lower {
+            value.as_str().map(str::to_string)
+        } else {
+            None
+        }
+    })
+}
+
+fn sanitize_account_headers(input: Option<&Map<String, Value>>, url: &Url) -> HeaderMap {
+    let mut headers = sanitize_headers(input);
+    if url.scheme() == "https" && url.host_str() == Some("opencode.ai") {
+        if let Some(cookie) = input_header_value(input, "Cookie") {
+            if cookie.contains("auth=") {
+                if let Ok(value) = HeaderValue::from_str(&cookie) {
+                    headers.insert(HeaderName::from_static("cookie"), value);
+                }
             }
         }
     }

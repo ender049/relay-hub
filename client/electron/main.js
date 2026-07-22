@@ -3,7 +3,7 @@ const fsSync = require('fs');
 const fs = require('fs/promises');
 const path = require('path');
 
-const STORE_KEYS = ['apm_s', 'apm_ch', 'apm_tab', 'apm_font', 'relay_theme', 'apm_ar'];
+const STORE_KEYS = ['apm_s', 'apm_ch', 'apm_acct', 'apm_tab', 'apm_font', 'relay_theme', 'apm_ar'];
 const OPEN_MODE_KEY = 'relay_open_mode';
 const WINDOW_STATE_KEY = 'relay_window_state';
 const STORE_FILE = 'store.json';
@@ -227,6 +227,23 @@ function sanitizeHeaders(input) {
   return out;
 }
 
+function headerValue(headers, name) {
+  const lower = String(name).toLowerCase();
+  for (const [key, value] of Object.entries(headers || {})) {
+    if (String(key).toLowerCase() === lower) return String(value || '');
+  }
+  return '';
+}
+
+function sanitizeAccountHeaders(input, parsedUrl) {
+  const headers = sanitizeHeaders(input);
+  if (parsedUrl && parsedUrl.protocol === 'https:' && parsedUrl.hostname === 'opencode.ai') {
+    const cookie = headerValue(input, 'Cookie');
+    if (cookie && /(^|;\s*)auth=/.test(cookie)) headers.Cookie = cookie;
+  }
+  return headers;
+}
+
 function setDefaultHeader(headers, name, value) {
   const lower = name.toLowerCase();
   if (!Object.keys(headers).some(key => key.toLowerCase() === lower)) headers[name] = value;
@@ -297,7 +314,7 @@ async function handleDesktopFetch(payload = {}) {
     if (kind === 'channel' && payload.browserFetch === true) {
       throw new Error('Electron 客户端暂未接入浏览器请求模式，请使用浏览器扩展或 Tauri 客户端。');
     }
-    const headers = sanitizeHeaders(payload.headers || {});
+    const headers = kind === 'account' ? sanitizeAccountHeaders(payload.headers || {}, parsed) : sanitizeHeaders(payload.headers || {});
     if (kind === 'channel') {
       setDefaultHeader(headers, 'Accept', 'application/json, text/plain, */*');
       setDefaultHeader(headers, 'Accept-Language', 'zh-CN,zh;q=0.9,en;q=0.8');
