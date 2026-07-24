@@ -123,6 +123,10 @@ window.addEventListener('message', async event => {
     await invoke('relay_open_external', { url: msg.url || '' });
     return;
   }
+  if (msg && msg.type === 'CPA_CHANNEL_FETCH_CANCEL' && msg.id) {
+    await invoke('relay_fetch_cancel', { requestId: msg.id }).catch(() => {});
+    return;
+  }
   if (!msg || msg.type !== 'CPA_CHANNEL_FETCH' || !msg.id) return;
   let response;
   try {

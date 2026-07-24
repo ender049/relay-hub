@@ -157,6 +157,10 @@ window.addEventListener('message', async event => {
     frame.contentWindow.postMessage({ type: 'RELAY_READ_SITE_TOKENS_RESULT', response }, '*');
     return;
   }
+  if (msg && msg.type === 'CPA_CHANNEL_FETCH_CANCEL' && msg.id) {
+    chrome.runtime.sendMessage({ type: 'CPA_CHANNEL_FETCH_CANCEL', id: msg.id }).catch(() => {});
+    return;
+  }
   if (!msg || msg.type !== 'CPA_CHANNEL_FETCH' || !msg.id) return;
   let response;
   try {

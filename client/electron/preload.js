@@ -8,6 +8,7 @@ contextBridge.exposeInMainWorld('relayHub', {
   openSidePanel: () => ipcRenderer.invoke('relay-open-sidepanel'),
   copyText: text => ipcRenderer.invoke('relay-copy-text', text),
   fetch: payload => ipcRenderer.invoke('relay-fetch', payload),
+  cancelFetch: id => ipcRenderer.invoke('relay-fetch-cancel', id),
   openSiteLogin: payload => ipcRenderer.invoke('relay-open-site-login', payload),
   readSiteTokens: (siteUrl, siteType) => ipcRenderer.invoke('relay-read-site-tokens', siteUrl, siteType),
   openExternal: url => ipcRenderer.invoke('relay-open-external', url),

@@ -1,8 +1,9 @@
 use base64::{engine::general_purpose, Engine as _};
+use futures::future::{AbortHandle, Abortable};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::{collections::HashSet, fs, path::PathBuf, sync::{atomic::{AtomicU64, Ordering}, mpsc, Mutex}, thread, time::{Duration, Instant}};
+use std::{collections::{HashMap, HashSet}, fs, path::PathBuf, sync::{atomic::{AtomicU64, Ordering}, mpsc, Mutex}, thread, time::{Duration, Instant}};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
@@ -29,6 +30,8 @@ static WINDOW_STATE_SAVE_SEQ: AtomicU64 = AtomicU64::new(1);
 struct AppState {
     store: Mutex<Map<String, Value>>,
     client: reqwest::Client,
+    fetch_aborts: Mutex<HashMap<String, AbortHandle>>,
+    browser_fetch_ids: Mutex<HashMap<String, String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -52,6 +55,8 @@ struct FetchPayload {
     site_type: Option<String>,
     username: Option<String>,
     password: Option<String>,
+    #[serde(rename = "requestId")]
+    request_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -465,10 +470,43 @@ async fn relay_read_site_tokens(app: AppHandle, state: State<'_, AppState>, site
 
 #[tauri::command]
 async fn relay_fetch(app: AppHandle, state: State<'_, AppState>, payload: FetchPayload) -> Result<FetchResponse, String> {
-    Ok(match do_fetch(&app, &state.client, payload).await {
-        Ok(response) => response,
-        Err(error) => FetchResponse { ok: false, status: 0, headers: Map::new(), body: String::new(), stream_timing: None, error: Some(error) },
+    let request_id = payload.request_id.clone().filter(|value| !value.is_empty());
+    let (abort_handle, abort_registration) = AbortHandle::new_pair();
+    if let Some(id) = request_id.as_deref() {
+        state.fetch_aborts.lock().map_err(|err| err.to_string())?.insert(id.to_string(), abort_handle);
+    }
+    let result = Abortable::new(do_fetch(&app, &state.client, &state, payload), abort_registration).await;
+    let mut browser_request_id = None;
+    if let Some(id) = request_id.as_deref() {
+        if let Ok(mut aborts) = state.fetch_aborts.lock() {
+            aborts.remove(id);
+        }
+        if let Ok(mut browser_ids) = state.browser_fetch_ids.lock() {
+            browser_request_id = browser_ids.remove(id);
+        }
+    }
+    if result.is_err() {
+        if let (Some(browser_request_id), Some(window)) = (browser_request_id, app.get_webview_window(LOGIN_WINDOW_LABEL)) {
+            let _ = window.eval(browser_fetch_cleanup_script(&browser_request_id)?);
+        }
+    }
+    Ok(match result {
+        Err(_) => FetchResponse { ok: false, status: 0, headers: Map::new(), body: String::new(), stream_timing: None, error: Some("请求已取消".to_string()) },
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => FetchResponse { ok: false, status: 0, headers: Map::new(), body: String::new(), stream_timing: None, error: Some(error) },
     })
+}
+
+#[tauri::command]
+async fn relay_fetch_cancel(app: AppHandle, state: State<'_, AppState>, request_id: String) -> Result<(), String> {
+    let browser_request_id = state.browser_fetch_ids.lock().map_err(|err| err.to_string())?.remove(&request_id);
+    if let (Some(browser_request_id), Some(window)) = (browser_request_id, app.get_webview_window(LOGIN_WINDOW_LABEL)) {
+        let _ = window.eval(browser_fetch_cleanup_script(&browser_request_id)?);
+    }
+    if let Some(handle) = state.fetch_aborts.lock().map_err(|err| err.to_string())?.remove(&request_id) {
+        handle.abort();
+    }
+    Ok(())
 }
 
 fn login_url(site_url: &str, site_type: Option<&str>) -> Result<Url, String> {
@@ -818,10 +856,10 @@ fn registrable_host(host: &str) -> String {
     }
 }
 
-async fn do_fetch(app: &AppHandle, client: &reqwest::Client, payload: FetchPayload) -> Result<FetchResponse, String> {
+async fn do_fetch(app: &AppHandle, client: &reqwest::Client, state: &State<'_, AppState>, payload: FetchPayload) -> Result<FetchResponse, String> {
     let url = Url::parse(&payload.url).map_err(|err| err.to_string())?;
     if payload.browser_fetch == Some(true) && payload.kind.as_deref() == Some("channel") {
-        return do_browser_fetch(app, &url, payload).await;
+        return do_browser_fetch(app, state, &url, payload).await;
     }
     let headers = if payload.kind.as_deref() == Some("account") {
         sanitize_account_headers(payload.headers.as_ref(), &url)
@@ -929,7 +967,7 @@ fn stream_sample(text: &str) -> String {
     out.chars().take(240).collect()
 }
 
-async fn do_browser_fetch(app: &AppHandle, url: &Url, payload: FetchPayload) -> Result<FetchResponse, String> {
+async fn do_browser_fetch(app: &AppHandle, state: &State<'_, AppState>, url: &Url, payload: FetchPayload) -> Result<FetchResponse, String> {
     let site_url = payload.site_url.as_deref().unwrap_or(&payload.url);
     let expected = Url::parse(site_url).map_err(|_| "浏览器请求模式缺少有效的渠道站点地址".to_string())?;
     if !site_hosts_match(url.host_str().unwrap_or_default(), expected.host_str().unwrap_or_default()) {
@@ -946,10 +984,10 @@ async fn do_browser_fetch(app: &AppHandle, url: &Url, payload: FetchPayload) -> 
         payload.password.as_deref().unwrap_or_default(),
     ).await?;
 
-    let mut response = run_browser_fetch(&window, &payload).await?;
+    let mut response = run_browser_fetch(&window, state, &payload).await?;
     if is_cloudflare_challenge_response(&response) {
         prepare_browser_session(&window, site_url, payload.site_type.as_deref(), payload.username.as_deref().unwrap_or_default(), payload.password.as_deref().unwrap_or_default(), false).await?;
-        response = run_browser_fetch(&window, &payload).await?;
+        response = run_browser_fetch(&window, state, &payload).await?;
         if is_cloudflare_challenge_response(&response) {
             show_login_window_for_revalidation(&window);
             return Ok(browser_session_expired_response(&expected));
@@ -1025,8 +1063,11 @@ fn show_login_window_for_revalidation(window: &tauri::WebviewWindow) {
     let _ = window.set_focus();
 }
 
-async fn run_browser_fetch(window: &tauri::WebviewWindow, payload: &FetchPayload) -> Result<FetchResponse, String> {
+async fn run_browser_fetch(window: &tauri::WebviewWindow, state: &State<'_, AppState>, payload: &FetchPayload) -> Result<FetchResponse, String> {
     let request_id = format!("relay_fetch_{}", BROWSER_FETCH_SEQ.fetch_add(1, Ordering::Relaxed));
+    if let Some(frontend_id) = payload.request_id.as_deref().filter(|value| !value.is_empty()) {
+        state.browser_fetch_ids.lock().map_err(|err| err.to_string())?.insert(frontend_id.to_string(), request_id.clone());
+    }
     window.eval(browser_fetch_start_script(payload, &request_id)?).map_err(|err| err.to_string())?;
 
     let started = Instant::now();
@@ -1035,10 +1076,20 @@ async fn run_browser_fetch(window: &tauri::WebviewWindow, payload: &FetchPayload
         let raw = eval_with_callback(window, browser_fetch_poll_script(&request_id)?, Duration::from_secs(5)).await?;
         let value: Value = serde_json::from_str(&raw).map_err(|err| err.to_string())?;
         if !value.is_null() {
+            if let Some(frontend_id) = payload.request_id.as_deref().filter(|value| !value.is_empty()) {
+                if let Ok(mut browser_ids) = state.browser_fetch_ids.lock() {
+                    browser_ids.remove(frontend_id);
+                }
+            }
             return parse_browser_fetch_response(&raw);
         }
     }
     let _ = window.eval(browser_fetch_cleanup_script(&request_id)?);
+    if let Some(frontend_id) = payload.request_id.as_deref().filter(|value| !value.is_empty()) {
+        if let Ok(mut browser_ids) = state.browser_fetch_ids.lock() {
+            browser_ids.remove(frontend_id);
+        }
+    }
     Err("浏览器请求超时".to_string())
 }
 
@@ -1057,7 +1108,7 @@ fn browser_fetch_start_script(payload: &FetchPayload, request_id: &str) -> Resul
     Ok(format!(r#"(() => {{
   const id = {id};
   const store = window.__relayHubFetchResults = window.__relayHubFetchResults || {{}};
-  store[id] = {{ done: false, result: null }};
+  store[id] = {{ done: false, result: null, controller: null }};
   (async () => {{
     try {{
       const body = {body};
@@ -1075,6 +1126,7 @@ fn browser_fetch_start_script(payload: &FetchPayload, request_id: &str) -> Resul
       }};
       if (body !== null && !/^(GET|HEAD)$/i.test(init.method)) init.body = body;
       const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+      if (store[id]) store[id].controller = controller;
       const timer = controller ? setTimeout(() => controller.abort(), 25000) : null;
       if (controller) init.signal = controller.signal;
       let res;
@@ -1248,6 +1300,7 @@ fn browser_fetch_cleanup_script(request_id: &str) -> Result<String, String> {
     let id = serde_json::to_string(request_id).map_err(|err| err.to_string())?;
     Ok(format!(r#"(() => {{
   const store = window.__relayHubFetchResults || {{}};
+  if (store[{id}] && store[{id}].controller) store[{id}].controller.abort();
   delete store[{id}];
 }})()"#))
 }
@@ -1437,6 +1490,8 @@ pub fn run() {
                     .cookie_store(true)
                     .build()
                     .map_err(|err| Box::<dyn std::error::Error>::from(err))?,
+                fetch_aborts: Mutex::new(HashMap::new()),
+                browser_fetch_ids: Mutex::new(HashMap::new()),
             });
             if let Some(window) = app.get_webview_window("main") {
                 apply_main_window_state(&window, &store);
@@ -1470,6 +1525,7 @@ pub fn run() {
             relay_open_site_login,
             relay_read_site_tokens,
             relay_fetch,
+            relay_fetch_cancel,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Relay Hub Tauri app")

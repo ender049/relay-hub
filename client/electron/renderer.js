@@ -109,6 +109,10 @@ window.addEventListener('message', async event => {
     await window.relayHub.openExternal(msg.url);
     return;
   }
+  if (msg && msg.type === 'CPA_CHANNEL_FETCH_CANCEL' && msg.id) {
+    await window.relayHub.cancelFetch?.(msg.id);
+    return;
+  }
   if (!msg || msg.type !== 'CPA_CHANNEL_FETCH' || !msg.id) return;
   let response;
   try {

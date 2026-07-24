@@ -1,6 +1,7 @@
 const OPEN_MODE_KEY = 'relay_open_mode';
 const POPUP_PATH = 'pages/popup.html';
 let accountCookieFetchChain = Promise.resolve();
+const pendingFetchControllers = new Map();
 
 applyOpenMode();
 chrome.runtime.onInstalled.addListener(applyOpenMode);
@@ -36,6 +37,11 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === 'CPA_CHANNEL_FETCH') {
     handleExtensionFetch(msg.payload || {}).then(sendResponse);
     return true;
+  }
+  if (msg.type === 'CPA_CHANNEL_FETCH_CANCEL' && msg.id) {
+    const controller = pendingFetchControllers.get(String(msg.id));
+    if (controller) controller.abort();
+    return false;
   }
   if (msg.type === 'RELAY_OPEN_SITE_LOGIN') {
     openSiteLogin(msg.payload || {}).then(sendResponse);
@@ -301,6 +307,9 @@ function registrableHost(host) {
 }
 
 async function handleExtensionFetch(payload) {
+  const requestId = String(payload.requestId || '');
+  const controller = typeof AbortController !== 'undefined' && requestId ? new AbortController() : null;
+  if (controller) pendingFetchControllers.set(requestId, controller);
   try {
     if (!payload.url) throw new Error('Missing request URL');
     const url = payload.url;
@@ -321,6 +330,7 @@ async function handleExtensionFetch(payload) {
       body,
       cache: 'no-store'
     };
+    if (controller) fetchOptions.signal = controller.signal;
     if (kind === 'channel') fetchOptions.credentials = 'include';
     if (kind === 'account') fetchOptions.credentials = 'include';
     const startedAt = Date.now();
@@ -343,7 +353,10 @@ async function handleExtensionFetch(payload) {
     }
     return { ok: res.ok, status: res.status, headers: responseHeaders, body: await res.text() };
   } catch (err) {
+    if (err && err.name === 'AbortError') return { ok: false, status: 0, error: '请求已取消' };
     return { ok: false, status: 0, error: err && err.message ? err.message : String(err) };
+  } finally {
+    if (requestId) pendingFetchControllers.delete(requestId);
   }
 }
 

@@ -16,6 +16,7 @@ const MIN_VISIBLE_SIZE = 80;
 let mainWindow = null;
 let storeCache = null;
 let windowStateSaveTimer = null;
+const pendingFetchControllers = new Map();
 
 const hasSingleInstanceLock = app.requestSingleInstanceLock();
 if (!hasSingleInstanceLock) app.quit();
@@ -307,6 +308,9 @@ async function collectStreamTimingResponse(res, responseHeaders, startedAt) {
 }
 
 async function handleDesktopFetch(payload = {}) {
+  const requestId = String(payload.requestId || '');
+  const controller = typeof AbortController !== 'undefined' && requestId ? new AbortController() : null;
+  if (controller) pendingFetchControllers.set(requestId, controller);
   try {
     if (!payload.url) throw new Error('Missing request URL');
     const parsed = new URL(payload.url);
@@ -325,7 +329,8 @@ async function handleDesktopFetch(payload = {}) {
       method: payload.method || 'GET',
       headers,
       body,
-      cache: 'no-store'
+      cache: 'no-store',
+      ...(controller ? { signal: controller.signal } : {})
     });
     const responseHeaders = {};
     res.headers.forEach((value, key) => {
@@ -340,8 +345,16 @@ async function handleDesktopFetch(payload = {}) {
     }
     return { ok: res.ok, status: res.status, headers: responseHeaders, body: await res.text() };
   } catch (err) {
+    if (err && err.name === 'AbortError') return { ok: false, status: 0, error: '请求已取消' };
     return { ok: false, status: 0, error: err && err.message ? err.message : String(err) };
+  } finally {
+    if (requestId) pendingFetchControllers.delete(requestId);
   }
+}
+
+function cancelDesktopFetch(id) {
+  const controller = pendingFetchControllers.get(String(id || ''));
+  if (controller) controller.abort();
 }
 
 async function openSiteLogin() {
@@ -373,6 +386,7 @@ function registerIpc() {
     return { ok: true };
   });
   ipcMain.handle('relay-fetch', (_event, payload) => handleDesktopFetch(payload));
+  ipcMain.handle('relay-fetch-cancel', (_event, id) => cancelDesktopFetch(id));
   ipcMain.handle('relay-open-site-login', (_event, payload) => openSiteLogin(payload));
   ipcMain.handle('relay-read-site-tokens', (_event, siteUrl, siteType) => readSiteTokens(siteUrl, siteType));
   ipcMain.handle('relay-open-external', (_event, url) => shell.openExternal(String(url || '')));
