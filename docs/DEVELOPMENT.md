@@ -42,6 +42,7 @@ src/background.js
 | `pages/sidepanel.html` | 浏览器侧边栏外壳 |
 | `src/shell.js` | 扩展外壳逻辑，负责存储同步、复制桥接、请求桥接 |
 | `src/host.js` | 共享宿主适配接口，屏蔽扩展与客户端差异 |
+| `src/auth-session.js` | New API refresh cookie、Session SID 和 Set-Cookie 纯逻辑 |
 | `pages/index.html` | 主 UI、CSS、模态框和 SVG 图标 |
 | `src/app.js` | 状态、渲染、CPA / 渠道请求、自动刷新和交互逻辑 |
 | `assets/relayhub.png` | 扩展图标 |
@@ -133,8 +134,12 @@ CPA 对象表示一个 CLI Proxy API 服务端。
 
 - 余额、今日消费、累计消费只来自接口同步。
 - 分组只来自用户可用分组接口。
-- 刷新时优先复用已保存 token 或登录会话。
-- New API 支持系统访问令牌和用户 ID 作为账号密码登录失败后的兜底，主要用于 Turnstile 拦截登录接口的站点。
+- New API 认证依次尝试已锚定用户 ID 的浏览器会话、系统访问令牌、已保存 token/cookie、新版 refresh cookie，账号密码登录放在最后。共享浏览器会话响应必须返回与锚点一致的用户 ID；账号密码手动登录或主动读取令牌并保存可建立锚点。
+- New API 的系统访问令牌优先于账号密码，适合 Turnstile 拦截登录接口的站点，也可避免产生额外登录 Session。
+- 启动和定时自动刷新只复用已有认证或调用 refresh；手动刷新和保存渠道允许账号密码登录。自动任务不会调用 `/api/user/login`。
+- 新版 New API 使用 `POST /api/user/auth/refresh` 和 `new_api_refresh` cookie 轮换 access token；`new_api_refresh` 只发送到 refresh 端点，普通业务请求继续携带旧版 session 等站点 cookie。refresh 请求从 `<sid>.<secret>` 提取 SID，并始终携带对应的 `X-Auth-Session`。渠道中已有 SID、用户 ID 时，响应必须保持一致。客户端保存响应中的 access token、用户 ID、Session SID 和轮换后的 cookie。refresh 延续现有 Session，不创建新 Session。
+- 旧版 New API cookie Session 保持兼容，客户端会先携带已保存 token/cookie 请求用户接口。
+- New API 返回 `AUTH_SESSION_LIMIT`、`AUTH_SESSION_ISSUANCE_LIMIT` 或会话上限提示时，应先关闭该渠道自动刷新，再在站点撤销其他会话；仍无法登录时重置密码后手动刷新。
 - Sub2API 支持访问令牌和刷新令牌作为账号密码登录失败后的兜底；前后端分离站点应填写 API 域名。
 - Sub2API 保存刷新令牌后，访问令牌缺失、即将过期或接口返回 `401` 时会调用 `/api/v1/auth/refresh` 换新。
 - 只有接口返回 `401` 时才清理运行时 token 并重新登录；配置中的 New API 系统访问令牌和 Sub2API 刷新令牌不自动清理。
@@ -189,7 +194,7 @@ CPA 和渠道地址都需要先规范化再拼接路径。
 - `client/electron/`：Electron 版骨架，当前保留登录接管接口占位。
 - `client/tauri/`：Tauri 版，包体更轻，已接入 New API / Sub2API + Turnstile 登录接管流程。
 
-认证策略是先尝试用户名密码自动登录；遇到 Turnstile 或登录接口拦截时，支持该能力的宿主打开登录页并代填当前渠道的用户名密码，用户完成真实登录后点击“读取令牌”回填配置。浏览器扩展使用同域标签页，Tauri 使用内置 WebView2 登录窗口，Electron 当前关闭该入口。Sub2API 回填访问/刷新令牌，New API 回填访问令牌并尽量补齐用户 ID。
+认证策略优先复用已建立用户 ID 锚点的浏览器会话、系统令牌和已保存会话。New API 自动刷新可通过 refresh cookie 轮换 access token，桌面宿主负责透传 channel Cookie、返回全部 `Set-Cookie`，并为 refresh 请求补同源 `Origin`。浏览器扩展对所有带 Cookie 的渠道请求执行串行同源临时隔离：保存同名 Cookie 的全部 Path/Domain 变体，安装 payload Cookie，通过已有同源标签页执行请求，读取轮换值后完整恢复 cookie jar。refresh 只安装唯一 `new_api_refresh`，并移除 `Authorization` 与 `New-Api-User`。无 Cookie 的 Bearer 请求由 service worker 独立发送。显式浏览器请求模式保留登录接管能力。扩展标签页和 Tauri WebView 只在成功的 `/api/user/auth/refresh`、`/api/user/login` 响应后回传 `new_api_refresh`，普通业务响应不回传共享 cookie jar。Tauri 的 reqwest 请求关闭全局 cookie jar，各渠道 cookie 由 payload 显式发送。遇到 Turnstile 或登录接口拦截时，支持该能力的宿主打开登录页并代填当前渠道的用户名密码，用户完成真实登录后点击“读取令牌”回填配置。浏览器扩展使用同域标签页，Tauri 使用内置 WebView2 登录窗口，Electron 当前关闭该入口。Sub2API 回填访问/刷新令牌，New API 回填访问令牌、cookie 并尽量补齐用户 ID。
 
 运行客户端：
 
@@ -218,6 +223,7 @@ npm run build:tauri:linux
 验证语法：
 
 ```bash
+npm test
 npm run check
 
 # 或逐个检查

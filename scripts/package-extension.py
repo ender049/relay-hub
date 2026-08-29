@@ -13,6 +13,7 @@ FILES = [
     'src/shell.js',
     'pages/index.html',
     'src/host.js',
+    'src/auth-session.js',
     'src/app.js',
     'assets/relayhub.png',
 ]

@@ -1,6 +1,6 @@
 use base64::{engine::general_purpose, Engine as _};
 use futures::future::{AbortHandle, Abortable};
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, SET_COOKIE};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::{collections::{HashMap, HashSet}, fs, path::PathBuf, sync::{atomic::{AtomicU64, Ordering}, mpsc, Mutex}, thread, time::{Duration, Instant}};
@@ -64,6 +64,8 @@ struct FetchResponse {
     ok: bool,
     status: u16,
     headers: Map<String, Value>,
+    #[serde(rename = "setCookies")]
+    set_cookies: Vec<String>,
     body: String,
     #[serde(rename = "streamTiming", skip_serializing_if = "Option::is_none")]
     stream_timing: Option<StreamTiming>,
@@ -491,9 +493,9 @@ async fn relay_fetch(app: AppHandle, state: State<'_, AppState>, payload: FetchP
         }
     }
     Ok(match result {
-        Err(_) => FetchResponse { ok: false, status: 0, headers: Map::new(), body: String::new(), stream_timing: None, error: Some("请求已取消".to_string()) },
+        Err(_) => FetchResponse { ok: false, status: 0, headers: Map::new(), set_cookies: Vec::new(), body: String::new(), stream_timing: None, error: Some("请求已取消".to_string()) },
         Ok(Ok(response)) => response,
-        Ok(Err(error)) => FetchResponse { ok: false, status: 0, headers: Map::new(), body: String::new(), stream_timing: None, error: Some(error) },
+        Ok(Err(error)) => FetchResponse { ok: false, status: 0, headers: Map::new(), set_cookies: Vec::new(), body: String::new(), stream_timing: None, error: Some(error) },
     })
 }
 
@@ -626,9 +628,17 @@ async fn read_login_window_tokens(app: &AppHandle, client: &reqwest::Client, sit
 
     let storage = eval_storage_snapshot(&window).await?;
     let mut cookies = window.cookies_for_url(expected.clone()).map_err(|err| err.to_string())?;
-    if current.host_str() != expected.host_str() {
-        if let Ok(current_cookies) = window.cookies_for_url(current.clone()) {
-            for cookie in current_cookies {
+    if let Ok(current_cookies) = window.cookies_for_url(current.clone()) {
+        for cookie in current_cookies {
+            if !cookies.iter().any(|item| item.name() == cookie.name() && item.value() == cookie.value()) {
+                cookies.push(cookie);
+            }
+        }
+    }
+    if site_type == Some("newapi") {
+        let refresh_url = expected.join("/api/user/auth/refresh").map_err(|err| err.to_string())?;
+        if let Ok(refresh_cookies) = window.cookies_for_url(refresh_url) {
+            for cookie in refresh_cookies {
                 if !cookies.iter().any(|item| item.name() == cookie.name() && item.value() == cookie.value()) {
                     cookies.push(cookie);
                 }
@@ -863,16 +873,21 @@ async fn do_fetch(app: &AppHandle, client: &reqwest::Client, state: &State<'_, A
     }
     let headers = if payload.kind.as_deref() == Some("account") {
         sanitize_account_headers(payload.headers.as_ref(), &url)
+    } else if payload.kind.as_deref() == Some("channel") {
+        sanitize_channel_headers(payload.headers.as_ref())
     } else {
         sanitize_headers(payload.headers.as_ref())
     };
     let method = payload.method.unwrap_or_else(|| "GET".to_string()).parse().map_err(|err| format!("invalid method: {err}"))?;
-    let mut request = client.request(method, url);
+    let mut request = client.request(method, url.clone());
     request = request.headers(headers);
 
     if payload.kind.as_deref() == Some("channel") {
         request = request.header("Accept", "application/json, text/plain, */*");
         request = request.header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8");
+        if url.path() == "/api/user/auth/refresh" {
+            request = request.header("Origin", url.origin().ascii_serialization());
+        }
     }
 
     if let Some(body64) = payload.body_base64.filter(|value| !value.is_empty()) {
@@ -886,13 +901,19 @@ async fn do_fetch(app: &AppHandle, client: &reqwest::Client, state: &State<'_, A
     let res = request.send().await.map_err(|err| err.to_string())?;
     let status = res.status().as_u16();
     let ok = res.status().is_success();
+    let set_cookies = res
+        .headers()
+        .get_all(SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok().map(str::to_string))
+        .collect::<Vec<_>>();
     let mut response_headers = Map::new();
     for (key, value) in res.headers().iter() {
         response_headers.insert(key.to_string(), Value::String(value.to_str().unwrap_or_default().to_string()));
     }
 
     if payload.stream_timing == Some(true) {
-        return collect_stream_timing_response(res, status, ok, response_headers, started_at).await;
+        return collect_stream_timing_response(res, status, ok, response_headers, set_cookies, started_at).await;
     }
 
     let bytes = res.bytes().await.map_err(|err| err.to_string())?;
@@ -902,10 +923,10 @@ async fn do_fetch(app: &AppHandle, client: &reqwest::Client, state: &State<'_, A
         String::from_utf8_lossy(&bytes).to_string()
     };
 
-    Ok(FetchResponse { ok, status, headers: response_headers, body, stream_timing: None, error: None })
+    Ok(FetchResponse { ok, status, headers: response_headers, set_cookies, body, stream_timing: None, error: None })
 }
 
-async fn collect_stream_timing_response(mut res: reqwest::Response, status: u16, ok: bool, headers: Map<String, Value>, started_at: Instant) -> Result<FetchResponse, String> {
+async fn collect_stream_timing_response(mut res: reqwest::Response, status: u16, ok: bool, headers: Map<String, Value>, set_cookies: Vec<String>, started_at: Instant) -> Result<FetchResponse, String> {
     let mut body = String::new();
     let mut first_token_ms = None;
     while let Some(chunk) = res.chunk().await.map_err(|err| err.to_string())? {
@@ -923,6 +944,7 @@ async fn collect_stream_timing_response(mut res: reqwest::Response, status: u16,
         ok,
         status,
         headers,
+        set_cookies,
         body,
         stream_timing: Some(StreamTiming { first_token_ms, total_ms: started_at.elapsed().as_millis(), sample }),
         error: None,
@@ -993,7 +1015,19 @@ async fn do_browser_fetch(app: &AppHandle, state: &State<'_, AppState>, url: &Ur
             return Ok(browser_session_expired_response(&expected));
         }
     }
+    if payload.site_type.as_deref() == Some("newapi") {
+        append_newapi_refresh_cookie(&window, &expected, url, &mut response);
+    }
     Ok(response)
+}
+
+fn append_newapi_refresh_cookie(window: &tauri::WebviewWindow, site_url: &Url, request_url: &Url, response: &mut FetchResponse) {
+    if !response.ok || !matches!(request_url.path(), "/api/user/auth/refresh" | "/api/user/login") { return; }
+    let Ok(refresh_url) = site_url.join("/api/user/auth/refresh") else { return };
+    let Ok(cookies) = window.cookies_for_url(refresh_url) else { return };
+    let Some(cookie) = cookies.iter().find(|cookie| cookie.name() == "new_api_refresh") else { return };
+    response.set_cookies.retain(|value| !value.trim_start().to_ascii_lowercase().starts_with("new_api_refresh="));
+    response.set_cookies.push(cookie.to_string());
 }
 
 async fn ensure_browser_fetch_site(window: &tauri::WebviewWindow, site_url: &str, site_type: Option<&str>, label: &str, username: &str, password: &str) -> Result<(), String> {
@@ -1115,9 +1149,15 @@ fn browser_fetch_start_script(payload: &FetchPayload, request_id: &str) -> Resul
       const siteType = {site_type};
       const headers = {headers};
 {auth_script}
-      const pageAuth = await relayHubCollectPageAuth(siteType);
-      if (pageAuth.token) relayHubSetHeader(headers, 'Authorization', /^Bearer\s+/i.test(pageAuth.token) ? pageAuth.token : 'Bearer ' + pageAuth.token);
-      if (siteType === 'newapi' && pageAuth.userId) relayHubSetHeader(headers, 'New-Api-User', pageAuth.userId);
+      const requestPath = new URL({url}).pathname;
+      if (requestPath === '/api/user/auth/refresh') {{
+        relayHubRemoveHeader(headers, 'Authorization');
+        relayHubRemoveHeader(headers, 'New-Api-User');
+      }} else {{
+        const pageAuth = await relayHubCollectPageAuth(siteType);
+        if (!relayHubHasHeader(headers, 'Authorization') && pageAuth.token) relayHubSetHeader(headers, 'Authorization', /^Bearer\s+/i.test(pageAuth.token) ? pageAuth.token : 'Bearer ' + pageAuth.token);
+        if (siteType === 'newapi' && !relayHubHasHeader(headers, 'New-Api-User') && pageAuth.userId) relayHubSetHeader(headers, 'New-Api-User', pageAuth.userId);
+      }}
       const init = {{
         method: {method},
         headers,
@@ -1201,6 +1241,16 @@ fn browser_fetch_auth_helper_script() -> &'static str {
           if (key.toLowerCase() === lower) delete headers[key];
         });
         headers[name] = String(value);
+      }
+      function relayHubHasHeader(headers, name) {
+        const lower = name.toLowerCase();
+        return Object.keys(headers).some(key => key.toLowerCase() === lower);
+      }
+      function relayHubRemoveHeader(headers, name) {
+        const lower = name.toLowerCase();
+        Object.keys(headers).forEach(key => {
+          if (key.toLowerCase() === lower) delete headers[key];
+        });
       }
       async function relayHubCollectPageAuth(siteType) {
         const dump = store => {
@@ -1358,6 +1408,7 @@ fn browser_session_expired_response(expected: &Url) -> FetchResponse {
         ok: false,
         status: 0,
         headers: Map::new(),
+        set_cookies: Vec::new(),
         body: String::new(),
         stream_timing: None,
         error: Some(format!("BROWSER_SESSION_REVALIDATION_REQUIRED: {} 浏览器会话验证已过期，请在 WebView2 登录窗口完成验证后重试", expected.host_str().unwrap_or_default())),
@@ -1418,6 +1469,7 @@ fn parse_browser_fetch_response(raw: &str) -> Result<FetchResponse, String> {
         ok: map.get("ok").and_then(Value::as_bool).unwrap_or(false),
         status: map.get("status").and_then(Value::as_u64).unwrap_or(0) as u16,
         headers,
+        set_cookies: map.get("setCookies").and_then(Value::as_array).map(|items| items.iter().filter_map(Value::as_str).map(str::to_string).collect()).unwrap_or_default(),
         body: map.get("body").and_then(Value::as_str).unwrap_or_default().to_string(),
         stream_timing: map.get("streamTiming").and_then(|value| serde_json::from_value(value.clone()).ok()),
         error: map.get("error").and_then(Value::as_str).map(str::to_string),
@@ -1428,7 +1480,7 @@ fn sanitize_headers(input: Option<&Map<String, Value>>) -> HeaderMap {
     let forbidden: HashSet<&'static str> = [
         "accept-charset", "accept-encoding", "access-control-request-headers",
         "access-control-request-method", "connection", "content-length",
-        "cookie2", "date", "dnt", "expect", "host", "keep-alive", "origin",
+        "cookie", "cookie2", "date", "dnt", "expect", "host", "keep-alive", "origin",
         "permissions-policy", "referer", "te", "trailer", "transfer-encoding",
         "upgrade", "user-agent", "via",
     ].into_iter().collect();
@@ -1474,6 +1526,16 @@ fn sanitize_account_headers(input: Option<&Map<String, Value>>, url: &Url) -> He
     headers
 }
 
+fn sanitize_channel_headers(input: Option<&Map<String, Value>>) -> HeaderMap {
+    let mut headers = sanitize_headers(input);
+    if let Some(cookie) = input_header_value(input, "Cookie") {
+        if let Ok(value) = HeaderValue::from_str(&cookie) {
+            headers.insert(HeaderName::from_static("cookie"), value);
+        }
+    }
+    headers
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -1487,7 +1549,7 @@ pub fn run() {
             app.manage(AppState {
                 store: Mutex::new(store.clone()),
                 client: reqwest::Client::builder()
-                    .cookie_store(true)
+                    .cookie_store(false)
                     .build()
                     .map_err(|err| Box::<dyn std::error::Error>::from(err))?,
                 fetch_aborts: Mutex::new(HashMap::new()),

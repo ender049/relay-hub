@@ -98,9 +98,11 @@ Sub2API 会回填访问令牌和刷新令牌。New API 会回填访问令牌，�
 
 ## 浏览器请求模式
 
-渠道表单提供统一的“浏览器请求模式”开关，配置字段为 `browserFetch`。共享应用层会读取宿主声明的 `browserFetch` 能力：能力开启时，该渠道的同步、兑换和密钥管理请求从第一条请求开始复用宿主浏览器上下文；能力关闭时，配置保留在渠道中，当前宿主继续使用常规请求路径。
+渠道表单提供统一的“浏览器请求模式”开关，配置字段为 `browserFetch`。共享浏览器会话以渠道 `userId` 为身份锚点：账号密码手动登录成功，或用户主动读取令牌取得用户 ID 并保存后，可建立该锚点。同步时浏览器会话响应必须返回相同用户 ID。新渠道或缺少锚点的渠道会继续尝试系统访问令牌、持久化 session/refresh cookie 和手动账号密码路径。
 
 浏览器扩展的执行器是同域已登录标签页，通过 `chrome.scripting.executeScript` 在页面内执行 `window.fetch()`。Tauri 的执行器是已登录 WebView2 登录窗口。Electron 当前声明 `browserFetch: false`。这个模式用于 Cloudflare Managed Challenge 保护 API 路径的站点。
+
+扩展渠道 Cookie 请求统一采用串行同源临时隔离：先保存同名 Cookie 的全部 Path/Domain 变体，再安装 payload 中的渠道 Cookie，通过已打开的同源标签页执行 `window.fetch()`，读取所需轮换值后完整恢复浏览器 cookie jar。该兼容路径只使用现有同源标签页；显式浏览器请求模式继续负责登录接管和创建标签页。`/api/user/auth/refresh` 事务只安装唯一的 `new_api_refresh`，只携带 `X-Auth-Session`，并移除 `Authorization` 与 `New-Api-User`；页面 fetch 自动生成正确的同源 Origin。恢复失败会使请求整体失败。无 Cookie 的 Bearer 渠道请求继续由 service worker 独立发送。
 
 ## 运行
 
@@ -120,6 +122,7 @@ npm run client:tauri  # Tauri
 检查语法：
 
 ```bash
+npm test
 npm run check
 ```
 

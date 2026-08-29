@@ -245,6 +245,13 @@ function sanitizeAccountHeaders(input, parsedUrl) {
   return headers;
 }
 
+function sanitizeChannelHeaders(input) {
+  const headers = sanitizeHeaders(input);
+  const cookie = headerValue(input, 'Cookie');
+  if (cookie) headers.Cookie = cookie;
+  return headers;
+}
+
 function setDefaultHeader(headers, name, value) {
   const lower = name.toLowerCase();
   if (!Object.keys(headers).some(key => key.toLowerCase() === lower)) headers[name] = value;
@@ -284,10 +291,10 @@ function streamSample(text) {
   return out.join('').slice(0, 240);
 }
 
-async function collectStreamTimingResponse(res, responseHeaders, startedAt) {
+async function collectStreamTimingResponse(res, responseHeaders, setCookies, startedAt) {
   if (!res.body || !res.body.getReader) {
     const body = await res.text();
-    return { ok: res.ok, status: res.status, headers: responseHeaders, body, streamTiming: { firstTokenMs: null, totalMs: Date.now() - startedAt, sample: streamSample(body) } };
+    return { ok: res.ok, status: res.status, headers: responseHeaders, setCookies, body, streamTiming: { firstTokenMs: null, totalMs: Date.now() - startedAt, sample: streamSample(body) } };
   }
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
@@ -304,7 +311,18 @@ async function collectStreamTimingResponse(res, responseHeaders, startedAt) {
   }
   body += decoder.decode();
   sample = streamSample(body);
-  return { ok: res.ok, status: res.status, headers: responseHeaders, body, streamTiming: { firstTokenMs, totalMs: Date.now() - startedAt, sample } };
+  return { ok: res.ok, status: res.status, headers: responseHeaders, setCookies, body, streamTiming: { firstTokenMs, totalMs: Date.now() - startedAt, sample } };
+}
+
+function responseSetCookies(headers) {
+  if (headers && typeof headers.getSetCookie === 'function') return headers.getSetCookie().map(String).filter(Boolean);
+  if (headers && typeof headers.raw === 'function') {
+    const raw = headers.raw();
+    const values = raw && (raw['set-cookie'] || raw['Set-Cookie']);
+    if (Array.isArray(values)) return values.map(String).filter(Boolean);
+  }
+  const value = headers && headers.get ? headers.get('set-cookie') : '';
+  return value ? [String(value)] : [];
 }
 
 async function handleDesktopFetch(payload = {}) {
@@ -318,10 +336,11 @@ async function handleDesktopFetch(payload = {}) {
     if (kind === 'channel' && payload.browserFetch === true) {
       throw new Error('Electron 客户端暂未接入浏览器请求模式，请使用浏览器扩展或 Tauri 客户端。');
     }
-    const headers = kind === 'account' ? sanitizeAccountHeaders(payload.headers || {}, parsed) : sanitizeHeaders(payload.headers || {});
+    const headers = kind === 'account' ? sanitizeAccountHeaders(payload.headers || {}, parsed) : kind === 'channel' ? sanitizeChannelHeaders(payload.headers || {}) : sanitizeHeaders(payload.headers || {});
     if (kind === 'channel') {
       setDefaultHeader(headers, 'Accept', 'application/json, text/plain, */*');
       setDefaultHeader(headers, 'Accept-Language', 'zh-CN,zh;q=0.9,en;q=0.8');
+      if (parsed.pathname === '/api/user/auth/refresh') setDefaultHeader(headers, 'Origin', parsed.origin);
     }
     const body = payload.bodyBase64 ? base64ToBytes(payload.bodyBase64) : (payload.body || undefined);
     const startedAt = Date.now();
@@ -336,14 +355,15 @@ async function handleDesktopFetch(payload = {}) {
     res.headers.forEach((value, key) => {
       responseHeaders[key] = value;
     });
+    const setCookies = responseSetCookies(res.headers);
     if (payload.streamTiming === true) {
-      return collectStreamTimingResponse(res, responseHeaders, startedAt);
+      return collectStreamTimingResponse(res, responseHeaders, setCookies, startedAt);
     }
     if (payload.responseType === 'base64') {
       const bytes = Buffer.from(await res.arrayBuffer());
-      return { ok: res.ok, status: res.status, headers: responseHeaders, body: bytes.toString('base64') };
+      return { ok: res.ok, status: res.status, headers: responseHeaders, setCookies, body: bytes.toString('base64') };
     }
-    return { ok: res.ok, status: res.status, headers: responseHeaders, body: await res.text() };
+    return { ok: res.ok, status: res.status, headers: responseHeaders, setCookies, body: await res.text() };
   } catch (err) {
     if (err && err.name === 'AbortError') return { ok: false, status: 0, error: '请求已取消' };
     return { ok: false, status: 0, error: err && err.message ? err.message : String(err) };

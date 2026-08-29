@@ -1,6 +1,10 @@
+importScripts('auth-session.js');
+
+const authSession = globalThis.RelayAuthSession;
 const OPEN_MODE_KEY = 'relay_open_mode';
 const POPUP_PATH = 'pages/popup.html';
 let accountCookieFetchChain = Promise.resolve();
+let channelCookieFetchChain = Promise.resolve();
 const pendingFetchControllers = new Map();
 
 applyOpenMode();
@@ -136,10 +140,41 @@ async function readSiteTokens(siteUrl, siteType) {
       func: extractSiteTokensInPage,
       args: [siteType || '']
     });
-    return { ok: true, siteUrl: expectedUrl.href, pageUrl: currentUrl.href, ...(result && result.result ? result.result : {}) };
+    const pageTokens = result && result.result ? result.result : {};
+    const cookie = siteType === 'newapi'
+      ? await mergeNewApiCookies(expectedUrl, pageTokens.cookie || '')
+      : pageTokens.cookie || '';
+    return { ok: true, siteUrl: expectedUrl.href, pageUrl: currentUrl.href, ...pageTokens, cookie };
   } catch (err) {
     return { ok: false, error: err && err.message ? err.message : String(err) };
   }
+}
+
+async function mergeNewApiCookies(siteUrl, cookieHeader) {
+  const refreshUrl = new URL('/api/user/auth/refresh', siteUrl).href;
+  const cookies = await chrome.cookies.getAll({ url: refreshUrl }).catch(() => []);
+  const jar = new Map();
+  String(cookieHeader || '').split(';').forEach(part => {
+    const index = part.indexOf('=');
+    if (index > 0) jar.set(part.slice(0, index).trim(), part.slice(index + 1).trim());
+  });
+  cookies.forEach(cookie => jar.set(cookie.name, cookie.value));
+  return Array.from(jar, ([name, value]) => `${name}=${value}`).join('; ');
+}
+
+async function readNewApiRefreshSetCookies(siteUrl) {
+  const refreshUrl = new URL('/api/user/auth/refresh', siteUrl).href;
+  const cookie = await chrome.cookies.get({ url: refreshUrl, name: 'new_api_refresh' }).catch(() => null);
+  if (!cookie) return [];
+  const parts = [`${cookie.name}=${cookie.value}`, `Path=${cookie.path || '/api/user/auth'}`];
+  if (!cookie.hostOnly && cookie.domain) parts.push(`Domain=${cookie.domain}`);
+  if (cookie.secure) parts.push('Secure');
+  if (cookie.httpOnly) parts.push('HttpOnly');
+  if (cookie.sameSite === 'no_restriction') parts.push('SameSite=None');
+  if (cookie.sameSite === 'lax') parts.push('SameSite=Lax');
+  if (cookie.sameSite === 'strict') parts.push('SameSite=Strict');
+  if (cookie.expirationDate) parts.push(`Expires=${new Date(cookie.expirationDate * 1000).toUTCString()}`);
+  return [parts.join('; ')];
 }
 
 function loginUrl(siteUrl, siteType) {
@@ -162,6 +197,20 @@ async function findSiteTab(expectedUrl, action) {
   const tab = tabs.find(item => item && item.id && item.url && tabMatchesSite(item, expectedUrl));
   if (tab) return tab;
   throw new Error(`${action}需要先打开并登录 ${expectedUrl.hostname} 标签页`);
+}
+
+async function findSameOriginTab(expectedUrl, action) {
+  const matches = tab => {
+    const current = parseHttpUrl(tab && tab.url);
+    return !!(tab && tab.id && current && current.origin === expectedUrl.origin);
+  };
+  const active = await chrome.tabs.query({ active: true, currentWindow: true });
+  const activeTab = active.find(matches);
+  if (activeTab) return activeTab;
+  const tabs = await chrome.tabs.query({});
+  const tab = tabs.find(matches);
+  if (tab) return tab;
+  throw new Error(`${action}需要先打开 ${expectedUrl.origin} 的同源标签页`);
 }
 
 function tabMatchesSite(tab, expectedUrl) {
@@ -316,7 +365,10 @@ async function handleExtensionFetch(payload) {
     const parsed = new URL(url);
     const kind = payload.kind || 'channel';
     if (kind === 'channel' && payload.browserFetch === true) {
-      return handleBrowserFetch(payload, parsed);
+      return await withChannelCookieLock(() => handleBrowserFetch(payload, parsed));
+    }
+    if (kind === 'channel' && headerValue(payload.headers || {}, 'Cookie')) {
+      return await fetchWithChannelCookies(payload, parsed);
     }
     const headers = kind === 'account' ? sanitizeAccountHeaders(payload.headers || {}, parsed) : sanitizeHeaders(payload.headers || {});
     if (kind === 'channel') {
@@ -331,16 +383,23 @@ async function handleExtensionFetch(payload) {
       cache: 'no-store'
     };
     if (controller) fetchOptions.signal = controller.signal;
-    if (kind === 'channel') fetchOptions.credentials = 'include';
+    if (kind === 'channel') fetchOptions.credentials = 'omit';
     if (kind === 'account') fetchOptions.credentials = 'include';
     const startedAt = Date.now();
-    const res = kind === 'account' ? await fetchWithAccountCookie(parsed, payload.headers || {}, fetchOptions) : await fetch(url, fetchOptions);
+    let res;
+    const setCookies = [];
+    if (kind === 'account') {
+      res = await fetchWithAccountCookie(parsed, payload.headers || {}, fetchOptions);
+    } else {
+      res = await fetch(url, fetchOptions);
+    }
     const responseHeaders = {};
     res.headers.forEach((value, key) => {
       responseHeaders[key] = value;
     });
     if (payload.streamTiming === true) {
-      return collectStreamTimingResponse(res, responseHeaders, startedAt);
+      const response = await collectStreamTimingResponse(res, responseHeaders, startedAt);
+      return { ...response, setCookies };
     }
     if (payload.responseType === 'base64') {
       const bytes = new Uint8Array(await res.arrayBuffer());
@@ -349,9 +408,9 @@ async function handleExtensionFetch(payload) {
       for (let i = 0; i < bytes.length; i += chunk) {
         binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
       }
-      return { ok: res.ok, status: res.status, headers: responseHeaders, body: btoa(binary) };
+      return { ok: res.ok, status: res.status, headers: responseHeaders, setCookies, body: btoa(binary) };
     }
-    return { ok: res.ok, status: res.status, headers: responseHeaders, body: await res.text() };
+    return { ok: res.ok, status: res.status, headers: responseHeaders, setCookies, body: await res.text() };
   } catch (err) {
     if (err && err.name === 'AbortError') return { ok: false, status: 0, error: '请求已取消' };
     return { ok: false, status: 0, error: err && err.message ? err.message : String(err) };
@@ -403,11 +462,16 @@ async function runBrowserFetchInTab(tab, payload, parsedUrl, headers) {
       headers: { ...(headers || {}) },
       body: payload.body || null,
       siteType: payload.siteType || '',
+      usePageAuth: payload.usePageAuth !== false,
       streamTiming: payload.streamTiming === true
     }]
   });
   const response = result && result.result ? result.result : { ok: false, status: 0, error: '浏览器请求没有返回结果' };
-  return { ...response, pageUrl: currentUrl ? currentUrl.href : '' };
+  const returnRefreshCookie = response.ok && payload.siteType === 'newapi' && ['/api/user/auth/refresh', '/api/user/login'].includes(parsedUrl.pathname);
+  const setCookies = returnRefreshCookie
+    ? await readNewApiRefreshSetCookies(parsedUrl)
+    : response.setCookies || [];
+  return { ...response, setCookies, pageUrl: currentUrl ? currentUrl.href : '' };
 }
 
 async function openLoginSessionTab(payload, expectedUrl, active) {
@@ -538,6 +602,13 @@ async function browserFetchInPage(payload) {
     });
     headers[name] = String(value);
   };
+  const hasHeader = (headers, name) => Object.keys(headers).some(key => key.toLowerCase() === name.toLowerCase());
+  const removeHeader = (headers, name) => {
+    const lower = name.toLowerCase();
+    Object.keys(headers).forEach(key => {
+      if (key.toLowerCase() === lower) delete headers[key];
+    });
+  };
   const collectPageAuth = async siteType => {
     const dump = store => {
       const out = {};
@@ -621,9 +692,16 @@ async function browserFetchInPage(payload) {
 
   try {
     const headers = { ...(payload.headers || {}) };
-    const pageAuth = await collectPageAuth(payload.siteType || '');
-    if (pageAuth.token) setHeader(headers, 'Authorization', /^Bearer\s+/i.test(pageAuth.token) ? pageAuth.token : 'Bearer ' + pageAuth.token);
-    if (payload.siteType === 'newapi' && pageAuth.userId) setHeader(headers, 'New-Api-User', pageAuth.userId);
+    const requestPath = new URL(payload.url).pathname;
+    const isNewApiRefresh = requestPath === '/api/user/auth/refresh';
+    if (isNewApiRefresh) {
+      removeHeader(headers, 'Authorization');
+      removeHeader(headers, 'New-Api-User');
+    } else if (payload.usePageAuth !== false) {
+      const pageAuth = await collectPageAuth(payload.siteType || '');
+      if (!hasHeader(headers, 'Authorization') && pageAuth.token) setHeader(headers, 'Authorization', /^Bearer\s+/i.test(pageAuth.token) ? pageAuth.token : 'Bearer ' + pageAuth.token);
+      if (payload.siteType === 'newapi' && !hasHeader(headers, 'New-Api-User') && pageAuth.userId) setHeader(headers, 'New-Api-User', pageAuth.userId);
+    }
     const init = {
       method: payload.method || 'GET',
       headers,
@@ -742,6 +820,135 @@ function fetchWithAccountCookie(parsedUrl, requestHeaders, fetchOptions) {
   const next = accountCookieFetchChain.catch(() => {}).then(run);
   accountCookieFetchChain = next.catch(() => {});
   return next;
+}
+
+function withChannelCookieLock(run) {
+  const next = channelCookieFetchChain.catch(() => {}).then(run);
+  channelCookieFetchChain = next.catch(() => {});
+  return next;
+}
+
+function fetchWithChannelCookies(payload, parsedUrl) {
+  return withChannelCookieLock(() => fetchWithChannelCookiesLocked(payload, parsedUrl));
+}
+
+async function fetchWithChannelCookiesLocked(payload, parsedUrl) {
+  if (!chrome.cookies) throw new Error('当前浏览器不支持隔离渠道 Cookie');
+  if (!chrome.scripting || !chrome.scripting.executeScript) throw new Error('当前浏览器不支持渠道 Cookie 同源请求');
+  const expectedUrl = parseHttpUrl(payload.siteUrl || payload.url);
+  if (!expectedUrl || !siteHostsMatch(parsedUrl.hostname, expectedUrl.hostname)) {
+    throw new Error('渠道 Cookie 请求缺少匹配的站点地址');
+  }
+  const refresh = parsedUrl.pathname === '/api/user/auth/refresh';
+  const pairs = cookiePairsFromHeader(headerValue(payload.headers || {}, 'Cookie'));
+  const installPairs = refresh
+    ? pairs.filter(([name]) => name.toLowerCase() === 'new_api_refresh')
+    : pairs;
+  if (refresh && installPairs.length !== 1) throw new Error('NewAPI refresh 请求需要唯一的 new_api_refresh cookie');
+  if (refresh && !headerValue(payload.headers || {}, 'X-Auth-Session')) throw new Error('NewAPI refresh 请求缺少 X-Auth-Session');
+  const names = new Set(installPairs.map(([name]) => name));
+  const tab = await findSameOriginTab(parsedUrl, '渠道 Cookie 同源请求');
+  const storeId = tab.cookieStoreId || '';
+  const headers = sanitizeBrowserFetchHeaders(payload.headers || {});
+  setDefaultHeader(headers, 'Accept', 'application/json, text/plain, */*');
+  setDefaultHeader(headers, 'Accept-Language', 'zh-CN,zh;q=0.9,en;q=0.8');
+  const capture = async () => {
+    const groups = await Promise.all(Array.from(names, name => chrome.cookies.getAll({ name, ...(storeId ? { storeId } : {}) })));
+    return groups.flat().filter(cookie => cookieDomainMatches(cookie, parsedUrl.hostname));
+  };
+  const transaction = await authSession.withCookieTransaction({
+    capture,
+    remove: cookie => removeChromeCookie(cookie, parsedUrl),
+    install: async () => {
+      const installed = [];
+      for (const [name, value] of installPairs) {
+        const cookie = await chrome.cookies.set({
+          url: parsedUrl.href,
+          name,
+          value,
+          path: refresh ? '/api/user/auth' : '/',
+          secure: parsedUrl.protocol === 'https:',
+          httpOnly: refresh,
+          sameSite: refresh ? 'strict' : 'unspecified',
+          ...(storeId ? { storeId } : {})
+        });
+        if (cookie) installed.push(cookie);
+      }
+      return installed;
+    },
+    execute: () => runBrowserFetchInTab(tab, { ...payload, siteType: '', usePageAuth: false }, parsedUrl, headers),
+    read: refresh ? async () => {
+      const current = await capture();
+      const rotated = current.filter(cookie => cookie.name === 'new_api_refresh');
+      if (rotated.length > 1) throw new Error('NewAPI refresh 响应产生了多个 refresh cookie');
+      return rotated[0] || null;
+    } : undefined,
+    restore: cookie => restoreChromeCookie(cookie, parsedUrl)
+  });
+  const setCookies = transaction.observed
+    ? [serializeChromeCookie(transaction.observed, '/api/user/auth')]
+    : ['new_api_refresh=; Path=/api/user/auth; Max-Age=0; HttpOnly'];
+  return refresh ? { ...transaction.result, setCookies } : transaction.result;
+}
+
+function cookiePairsFromHeader(cookieHeader) {
+  const pairs = [];
+  for (const part of String(cookieHeader || '').split(';')) {
+    const index = part.indexOf('=');
+    if (index <= 0) continue;
+    const name = part.slice(0, index).trim();
+    if (name) pairs.push([name, part.slice(index + 1).trim()]);
+  }
+  return pairs;
+}
+
+function cookieDomainMatches(cookie, hostname) {
+  const domain = String(cookie.domain || '').replace(/^\./, '').toLowerCase();
+  const host = String(hostname || '').toLowerCase();
+  return !!domain && (host === domain || host.endsWith('.' + domain));
+}
+
+function chromeCookieUrl(cookie, fallbackUrl) {
+  const host = String(cookie.domain || fallbackUrl.hostname).replace(/^\./, '');
+  const protocol = cookie.secure ? 'https:' : fallbackUrl.protocol;
+  const path = String(cookie.path || '/');
+  return `${protocol}//${host}${path.startsWith('/') ? path : '/' + path}`;
+}
+
+function removeChromeCookie(cookie, fallbackUrl) {
+  const details = { url: chromeCookieUrl(cookie, fallbackUrl), name: cookie.name };
+  if (cookie.storeId) details.storeId = cookie.storeId;
+  if (cookie.partitionKey) details.partitionKey = cookie.partitionKey;
+  return chrome.cookies.remove(details);
+}
+
+function restoreChromeCookie(cookie, fallbackUrl) {
+  const details = {
+    url: chromeCookieUrl(cookie, fallbackUrl),
+    name: cookie.name,
+    value: cookie.value,
+    path: cookie.path || '/',
+    secure: cookie.secure === true,
+    httpOnly: cookie.httpOnly === true,
+    sameSite: cookie.sameSite || 'unspecified'
+  };
+  if (!cookie.hostOnly && cookie.domain) details.domain = cookie.domain;
+  if (!cookie.session && cookie.expirationDate) details.expirationDate = cookie.expirationDate;
+  if (cookie.storeId) details.storeId = cookie.storeId;
+  if (cookie.partitionKey) details.partitionKey = cookie.partitionKey;
+  return chrome.cookies.set(details);
+}
+
+function serializeChromeCookie(cookie, defaultPath) {
+  const parts = [`${cookie.name}=${cookie.value}`, `Path=${cookie.path || defaultPath || '/'}`];
+  if (!cookie.hostOnly && cookie.domain) parts.push(`Domain=${cookie.domain}`);
+  if (cookie.secure) parts.push('Secure');
+  if (cookie.httpOnly) parts.push('HttpOnly');
+  if (cookie.sameSite === 'no_restriction') parts.push('SameSite=None');
+  if (cookie.sameSite === 'lax') parts.push('SameSite=Lax');
+  if (cookie.sameSite === 'strict') parts.push('SameSite=Strict');
+  if (cookie.expirationDate) parts.push(`Expires=${new Date(cookie.expirationDate * 1000).toUTCString()}`);
+  return parts.join('; ');
 }
 
 async function fetchWithAccountCookieLocked(parsedUrl, requestHeaders, fetchOptions) {
