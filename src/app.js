@@ -317,7 +317,7 @@ function fmtRatio(v){const n=ratioNumber(v);return n==null?'-':n.toFixed(4).repl
 function ratioNumber(v){const n=Number(String(v??'').trim().replace(/x$/i,''));return Number.isFinite(n)&&n>0?n:null}
 function channelRechargeRatio(d){return ratioNumber(d?.rechargeRatioManual)??ratioNumber(d?.rechargeRatio)}
 function channelActualMultiplier(c,nominal){const n=ratioNumber(nominal),r=channelRechargeRatio(c?.data||c);return n==null?null:r==null?n:n/r}
-function channelRatioText(c,nominal){const actual=channelActualMultiplier(c,nominal);return actual==null||Math.abs(actual-1)<0.00005?'':fmtRatio(actual)}
+function channelRatioText(c,nominal){const actual=channelActualMultiplier(c,nominal);return actual==null?'':fmtRatio(actual)}
 function scaleChannelValue(d,value){if(value==null||(typeof value==='string'&&!value.trim()))return value;const n=Number(value),r=channelRechargeRatio(d);return Number.isFinite(n)&&r? n/r:value}
 function fmtNewQuota(raw,status){if(raw==null||(typeof raw==='string'&&!raw.trim())||Number.isNaN(Number(raw)))return'-';const q=Number(raw),qpu=Number(status?.quota_per_unit)||500000,typ=String(status?.quota_display_type||'USD').toUpperCase();if(typ==='TOKENS')return fmtNum(q,0)+' 点';const usd=q/qpu;if(typ==='CNY')return '¥'+(usd*(Number(status?.usd_exchange_rate)||1)).toFixed(2);if(typ==='CUSTOM'){const sym=status?.custom_currency_symbol||'¤',rate=Number(status?.custom_currency_exchange_rate)||1;return sym+(usd*rate).toFixed(2)}return fmtMoney(usd)}
 function cleanManual(m,baseUrl=''){const out={};const rr=String(m?.rechargeRatio??'').trim();if(rr)out.rechargeRatio=rr;const topup=cleanUrlText(m?.topupUrl??'');if(topup)out.topupUrl=/^https?:\/\//i.test(topup)||!baseUrl?normHttpUrl(topup,'https'):joinUrl(baseUrl,topup);return out}
