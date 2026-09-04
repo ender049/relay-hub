@@ -13,7 +13,7 @@
     "build:tauri:linux": "node scripts/run-tauri.js build --bundles deb,rpm && node scripts/collect-release.js",
     "build:tauri:windows-gnu-exe": "node scripts/run-rustup.js target add x86_64-pc-windows-gnu && node scripts/run-tauri.js build --target x86_64-pc-windows-gnu --no-bundle && node scripts/collect-release.js",
     "build:tauri:windows-msvc-exe": "node scripts/run-rustup.js target add x86_64-pc-windows-msvc && node scripts/run-tauri.js build --target x86_64-pc-windows-msvc --no-bundle && node scripts/collect-release.js",
-    "check": "node --check src/auth-session.js src/host.js src/app.js src/background.js src/shell.js client/electron/main.js client/electron/preload.js client/electron/renderer.js client/tauri/tauri-shell.js scripts/prepare-tauri.js scripts/collect-release.js scripts/run-tauri.js scripts/run-rustup.js",
+    "check": "node --check src/auth-session.js src/host.js src/app.js src/channel-monitor.js src/background.js src/shell.js client/electron/main.js client/electron/preload.js client/electron/renderer.js client/tauri/tauri-shell.js scripts/prepare-tauri.js scripts/collect-release.js scripts/run-tauri.js scripts/run-rustup.js",
     "package:extension": "python3 scripts/package-extension.py && node scripts/collect-release.js",
     "prepare:tauri": "node scripts/prepare-tauri.js",
     "release:collect": "node scripts/collect-release.js"

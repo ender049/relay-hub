@@ -14,6 +14,7 @@ FILES = [
     'pages/index.html',
     'src/host.js',
     'src/auth-session.js',
+    'src/channel-monitor.js',
     'src/app.js',
     'assets/relayhub.png',
 ]
