@@ -132,7 +132,7 @@ CPA 对象表示一个 CLI Proxy API 服务端。
 
 主要原则：
 
-- 余额、今日消费、累计消费只来自接口同步。
+- 余额、今日消费、累计消费和 Token 只来自聚合接口同步。NewAPI 不读取或分页扫描调用日志；Sub2API 使用 dashboard stats 显示缓存读取 Token、今日总 Token 和两者占比，各读数通过 title 标明含义。
 - 分组只来自用户可用分组接口。
 - New API 认证依次尝试已锚定用户 ID 的浏览器会话、系统访问令牌、已保存 token/cookie、新版 refresh cookie，账号密码登录放在最后。共享浏览器会话响应必须返回与锚点一致的用户 ID；账号密码手动登录或主动读取令牌并保存可建立锚点。
 - New API 的系统访问令牌优先于账号密码，适合 Turnstile 拦截登录接口的站点，也可避免产生额外登录 Session。
