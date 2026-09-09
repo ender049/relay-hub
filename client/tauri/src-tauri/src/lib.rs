@@ -26,12 +26,14 @@ const MIN_VISIBLE_SIZE: i32 = 80;
 const LOGIN_WINDOW_LABEL: &str = "channel-login";
 static BROWSER_FETCH_SEQ: AtomicU64 = AtomicU64::new(1);
 static WINDOW_STATE_SAVE_SEQ: AtomicU64 = AtomicU64::new(1);
+static WINDOW_DISPLAY_RESIZE_SEQ: AtomicU64 = AtomicU64::new(1);
 
 struct AppState {
     store: Mutex<Map<String, Value>>,
     client: reqwest::Client,
     fetch_aborts: Mutex<HashMap<String, AbortHandle>>,
     browser_fetch_ids: Mutex<HashMap<String, String>>,
+    window_display: Mutex<Option<WindowDisplayState>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -95,7 +97,29 @@ struct WindowState {
     y: Option<i32>,
     width: u32,
     height: u32,
+    desired_width: u32,
+    desired_height: u32,
+    work_area_width: Option<u32>,
+    work_area_height: Option<u32>,
+    work_area_x: Option<i32>,
+    work_area_y: Option<i32>,
     maximized: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DisplayWorkArea {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct WindowDisplayState {
+    work_area: DisplayWorkArea,
+    size: PhysicalSize<u32>,
+    requested_size: PhysicalSize<u32>,
+    pending_resize: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -220,8 +244,273 @@ fn saved_window_state(store: &Map<String, Value>) -> Option<WindowState> {
             DEFAULT_MAIN_WINDOW_HEIGHT,
             MIN_MAIN_WINDOW_HEIGHT,
         ),
+        desired_width: window_state_u32(
+            state.get("desired_width").or_else(|| state.get("width")),
+            DEFAULT_MAIN_WINDOW_WIDTH,
+            1,
+        ),
+        desired_height: window_state_u32(
+            state.get("desired_height").or_else(|| state.get("height")),
+            DEFAULT_MAIN_WINDOW_HEIGHT,
+            1,
+        ),
+        work_area_width: state
+            .get("work_area_width")
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok()),
+        work_area_height: state
+            .get("work_area_height")
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok()),
+        work_area_x: window_state_i32(state.get("work_area_x")),
+        work_area_y: window_state_i32(state.get("work_area_y")),
         maximized: state.get("maximized").and_then(Value::as_bool).unwrap_or(false),
     })
+}
+
+fn current_display_work_area(window: &tauri::WebviewWindow) -> Option<DisplayWorkArea> {
+    window.current_monitor().ok().flatten().map(|monitor| {
+        let area = monitor.work_area();
+        DisplayWorkArea {
+            x: area.position.x,
+            y: area.position.y,
+            width: area.size.width,
+            height: area.size.height,
+        }
+    })
+}
+
+fn scale_window_size_raw(
+    size: PhysicalSize<u32>,
+    source: DisplayWorkArea,
+    target: DisplayWorkArea,
+) -> PhysicalSize<u32> {
+    let scale = (target.width as f64 / source.width.max(1) as f64)
+        .min(target.height as f64 / source.height.max(1) as f64);
+    PhysicalSize::new(
+        ((size.width as f64) * scale)
+            .round()
+            .clamp(0.0, MAX_WINDOW_DIMENSION as f64) as u32,
+        ((size.height as f64) * scale)
+            .round()
+            .clamp(0.0, MAX_WINDOW_DIMENSION as f64) as u32,
+    )
+}
+
+fn clamp_window_size(size: PhysicalSize<u32>, scale_factor: f64) -> PhysicalSize<u32> {
+    let scale_factor = if scale_factor.is_finite() && scale_factor > 0.0 {
+        scale_factor
+    } else {
+        1.0
+    };
+    let min_width = (MIN_MAIN_WINDOW_WIDTH as f64 * scale_factor).round() as u32;
+    let min_height = (MIN_MAIN_WINDOW_HEIGHT as f64 * scale_factor).round() as u32;
+    PhysicalSize::new(
+        size.width.clamp(min_width, MAX_WINDOW_DIMENSION),
+        size.height.clamp(min_height, MAX_WINDOW_DIMENSION),
+    )
+}
+
+fn initialize_window_display_state(app: &AppHandle, window: &tauri::WebviewWindow) -> bool {
+    let (Some(current_work_area), Ok(size)) = (current_display_work_area(window), window.inner_size()) else {
+        return false;
+    };
+    let state = app.state::<AppState>();
+    let saved_state = {
+        let store = state.store.lock().expect("store mutex poisoned");
+        saved_window_state(&store)
+    };
+    let work_area = saved_state
+        .as_ref()
+        .and_then(|saved| {
+            Some(DisplayWorkArea {
+                x: saved.work_area_x?,
+                y: saved.work_area_y?,
+                width: saved.work_area_width?,
+                height: saved.work_area_height?,
+            })
+        })
+        .unwrap_or(current_work_area);
+    let requested_size = saved_state
+        .map(|saved| PhysicalSize::new(saved.desired_width, saved.desired_height))
+        .unwrap_or(size);
+    let mut display_state = state
+        .window_display
+        .lock()
+        .expect("display state mutex poisoned");
+    if display_state.is_none() {
+        *display_state = Some(WindowDisplayState {
+            work_area,
+            size,
+            requested_size,
+            pending_resize: None,
+        });
+    }
+    true
+}
+
+fn clear_pending_display_resize(app: &AppHandle, seq: u64) {
+    if WINDOW_DISPLAY_RESIZE_SEQ.load(Ordering::Relaxed) != seq {
+        return;
+    }
+    if let Some(state) = app
+        .state::<AppState>()
+        .window_display
+        .lock()
+        .expect("display state mutex poisoned")
+        .as_mut()
+    {
+        if state.pending_resize == Some(seq) {
+            state.pending_resize = None;
+        }
+    }
+}
+
+fn schedule_display_resize(app: AppHandle, window: tauri::WebviewWindow) {
+    let seq = WINDOW_DISPLAY_RESIZE_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+    if !initialize_window_display_state(&app, &window) {
+        return;
+    }
+    if let Some(state) = app
+        .state::<AppState>()
+        .window_display
+        .lock()
+        .expect("display state mutex poisoned")
+        .as_mut()
+    {
+        state.pending_resize = Some(seq);
+    }
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(180));
+        if WINDOW_DISPLAY_RESIZE_SEQ.load(Ordering::Relaxed) != seq {
+            return;
+        }
+        let mut current_work_area = None;
+        for _ in 0..8 {
+            if let Some(work_area) = current_display_work_area(&window) {
+                current_work_area = Some(work_area);
+                break;
+            }
+            thread::sleep(Duration::from_millis(80));
+        }
+        let Some(current_work_area) = current_work_area else {
+            clear_pending_display_resize(&app, seq);
+            return;
+        };
+        let Ok(current_size) = window.inner_size() else {
+            clear_pending_display_resize(&app, seq);
+            return;
+        };
+        let scale_factor = window.scale_factor().unwrap_or(1.0);
+        let maximized = window.is_maximized().unwrap_or(false);
+        let state = app.state::<AppState>();
+        let mut display_state = state
+            .window_display
+            .lock()
+            .expect("display state mutex poisoned");
+        let Some(previous_state) = display_state.as_ref().copied() else { return };
+        if previous_state.pending_resize != Some(seq) {
+            return;
+        }
+        if previous_state.work_area == current_work_area {
+            if let Some(state) = display_state.as_mut() {
+                state.size = current_size;
+                if !maximized {
+                    state.requested_size = current_size;
+                }
+                state.pending_resize = None;
+            }
+            drop(display_state);
+            schedule_main_window_state_save(app.clone(), window.clone());
+            return;
+        }
+        if maximized {
+            if let Some(state) = display_state.as_mut() {
+                state.work_area = current_work_area;
+                state.size = current_size;
+                state.pending_resize = None;
+            }
+            drop(display_state);
+            schedule_main_window_state_save(app.clone(), window.clone());
+            return;
+        }
+        let requested_size = scale_window_size_raw(
+            previous_state.requested_size,
+            previous_state.work_area,
+            current_work_area,
+        );
+        let size = clamp_window_size(requested_size, scale_factor);
+        if size == previous_state.size {
+            if let Some(state) = display_state.as_mut() {
+                state.work_area = current_work_area;
+                state.size = current_size;
+                state.requested_size = requested_size;
+                state.pending_resize = None;
+            }
+            drop(display_state);
+            schedule_main_window_state_save(app.clone(), window.clone());
+            return;
+        }
+        if let Some(state) = display_state.as_mut() {
+            state.work_area = current_work_area;
+            state.size = size;
+            state.requested_size = requested_size;
+        }
+        drop(display_state);
+        if window.set_size(size).is_err() {
+            if let Some(state) = app
+                .state::<AppState>()
+                .window_display
+                .lock()
+                .expect("display state mutex poisoned")
+                .as_mut()
+            {
+                state.pending_resize = None;
+            }
+            return;
+        }
+        keep_window_in_work_area(&window, current_work_area);
+        schedule_main_window_state_save(app.clone(), window.clone());
+
+        thread::sleep(Duration::from_millis(500));
+        if WINDOW_DISPLAY_RESIZE_SEQ.load(Ordering::Relaxed) == seq {
+            if let Some(state) = app
+                .state::<AppState>()
+                .window_display
+                .lock()
+                .expect("display state mutex poisoned")
+                .as_mut()
+            {
+                if state.pending_resize == Some(seq) {
+                    state.pending_resize = None;
+                }
+            }
+        }
+    });
+}
+
+fn keep_window_in_work_area(window: &tauri::WebviewWindow, display: DisplayWorkArea) {
+    let (Ok(position), Ok(size)) = (window.outer_position(), window.outer_size()) else { return };
+    let position = position_in_work_area(position, size, display);
+    let _ = window.set_position(position);
+}
+
+fn position_in_work_area(
+    position: PhysicalPosition<i32>,
+    size: PhysicalSize<u32>,
+    display: DisplayWorkArea,
+) -> PhysicalPosition<i32> {
+    let max_x = display
+        .x
+        .saturating_add(display.width as i32)
+        .saturating_sub(size.width as i32);
+    let max_y = display
+        .y
+        .saturating_add(display.height as i32)
+        .saturating_sub(size.height as i32);
+    let x = position.x.clamp(display.x, max_x.max(display.x));
+    let y = position.y.clamp(display.y, max_y.max(display.y));
+    PhysicalPosition::new(x, y)
 }
 
 fn overlap_size(start_a: i32, size_a: u32, start_b: i32, size_b: u32) -> i32 {
@@ -254,12 +543,12 @@ fn has_visible_window_area(
 
 fn apply_main_window_state(window: &tauri::WebviewWindow, store: &Map<String, Value>) {
     let Some(state) = saved_window_state(store) else { return };
-    let _ = window.set_size(PhysicalSize::new(state.width, state.height));
     if let (Some(x), Some(y)) = (state.x, state.y) {
         if has_visible_window_area(window, x, y, state.width, state.height) {
             let _ = window.set_position(PhysicalPosition::new(x, y));
         }
     }
+    let _ = window.set_size(PhysicalSize::new(state.width, state.height));
     if state.maximized {
         let _ = window.maximize();
     }
@@ -280,10 +569,18 @@ fn save_main_window_state(app: &AppHandle, window: &tauri::WebviewWindow) {
         .unwrap_or_default();
     window_state.insert("maximized".to_string(), Value::Bool(maximized));
 
+    if let Ok(position) = window.outer_position() {
+        window_state.insert("x".to_string(), json!(position.x));
+        window_state.insert("y".to_string(), json!(position.y));
+    }
+    if let Some(work_area) = current_display_work_area(window) {
+        window_state.insert("work_area_x".to_string(), json!(work_area.x));
+        window_state.insert("work_area_y".to_string(), json!(work_area.y));
+        window_state.insert("work_area_width".to_string(), json!(work_area.width));
+        window_state.insert("work_area_height".to_string(), json!(work_area.height));
+    }
     if !maximized {
-        if let (Ok(position), Ok(size)) = (window.outer_position(), window.outer_size()) {
-            window_state.insert("x".to_string(), json!(position.x));
-            window_state.insert("y".to_string(), json!(position.y));
+        if let Ok(size) = window.inner_size() {
             window_state.insert(
                 "width".to_string(),
                 json!(size.width.clamp(MIN_MAIN_WINDOW_WIDTH, MAX_WINDOW_DIMENSION)),
@@ -292,6 +589,15 @@ fn save_main_window_state(app: &AppHandle, window: &tauri::WebviewWindow) {
                 "height".to_string(),
                 json!(size.height.clamp(MIN_MAIN_WINDOW_HEIGHT, MAX_WINDOW_DIMENSION)),
             );
+            let desired_size = state
+                .window_display
+                .lock()
+                .expect("display state mutex poisoned")
+                .as_ref()
+                .map(|display| display.requested_size)
+                .unwrap_or(size);
+            window_state.insert("desired_width".to_string(), json!(desired_size.width));
+            window_state.insert("desired_height".to_string(), json!(desired_size.height));
         }
     }
 
@@ -1554,16 +1860,35 @@ pub fn run() {
                     .map_err(|err| Box::<dyn std::error::Error>::from(err))?,
                 fetch_aborts: Mutex::new(HashMap::new()),
                 browser_fetch_ids: Mutex::new(HashMap::new()),
+                window_display: Mutex::new(None),
             });
             if let Some(window) = app.get_webview_window("main") {
                 apply_main_window_state(&window, &store);
                 let event_window = window.clone();
                 let app_handle = app.handle().clone();
                 window.on_window_event(move |event| match event {
-                    WindowEvent::Moved(_)
-                    | WindowEvent::Resized(_)
-                    | WindowEvent::ScaleFactorChanged { .. }
-                    | WindowEvent::Focused(false) => {
+                    WindowEvent::Moved(_) | WindowEvent::ScaleFactorChanged { .. } => {
+                        schedule_display_resize(app_handle.clone(), event_window.clone());
+                        schedule_main_window_state_save(app_handle.clone(), event_window.clone());
+                    }
+                    WindowEvent::Resized(size) => {
+                        if let Some(state) = app_handle
+                            .state::<AppState>()
+                            .window_display
+                            .lock()
+                            .expect("display state mutex poisoned")
+                            .as_mut()
+                        {
+                            state.size = *size;
+                            if state.pending_resize.is_none()
+                                && !event_window.is_maximized().unwrap_or(false)
+                            {
+                                state.requested_size = *size;
+                            }
+                        }
+                        schedule_main_window_state_save(app_handle.clone(), event_window.clone());
+                    }
+                    WindowEvent::Focused(false) => {
                         schedule_main_window_state_save(app_handle.clone(), event_window.clone());
                     }
                     WindowEvent::CloseRequested { api, .. } => {
@@ -1572,6 +1897,7 @@ pub fn run() {
                     }
                     _ => {}
                 });
+                let _ = initialize_window_display_state(app.handle(), &window);
             }
             start_minimize_watcher(app.handle().clone());
             Ok(())
@@ -1598,4 +1924,105 @@ pub fn run() {
                 }
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scales_window_with_the_smaller_work_area_ratio() {
+        let source = DisplayWorkArea {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1040,
+        };
+        let target = DisplayWorkArea {
+            x: 0,
+            y: 0,
+            width: 3840,
+            height: 2080,
+        };
+
+        assert_eq!(
+            scale_window_size_raw(PhysicalSize::new(420, 720), source, target),
+            PhysicalSize::new(840, 1440)
+        );
+        assert_eq!(
+            scale_window_size_raw(PhysicalSize::new(840, 1440), target, source),
+            PhysicalSize::new(420, 720)
+        );
+
+        let different_aspect_ratio = DisplayWorkArea {
+            x: 0,
+            y: 0,
+            width: 2560,
+            height: 1440,
+        };
+        assert_eq!(
+            scale_window_size_raw(PhysicalSize::new(420, 720), source, different_aspect_ratio),
+            PhysicalSize::new(560, 960)
+        );
+    }
+
+    #[test]
+    fn keeps_scaled_window_above_minimum_dimensions() {
+        let source = DisplayWorkArea {
+            x: 0,
+            y: 0,
+            width: 3840,
+            height: 2080,
+        };
+        let target = DisplayWorkArea {
+            x: 0,
+            y: 0,
+            width: 1280,
+            height: 680,
+        };
+
+        assert_eq!(
+            clamp_window_size(
+                scale_window_size_raw(PhysicalSize::new(420, 720), source, target),
+                1.0,
+            ),
+            PhysicalSize::new(MIN_MAIN_WINDOW_WIDTH, MIN_MAIN_WINDOW_HEIGHT)
+        );
+    }
+
+    #[test]
+    fn distinguishes_work_areas_by_position() {
+        let primary = DisplayWorkArea {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1040,
+        };
+        let secondary = DisplayWorkArea {
+            x: 1920,
+            ..primary
+        };
+
+        assert_eq!(primary, primary);
+        assert_ne!(primary, secondary);
+    }
+
+    #[test]
+    fn keeps_resized_window_inside_confirmed_target_display() {
+        let target = DisplayWorkArea {
+            x: 1920,
+            y: 0,
+            width: 1920,
+            height: 1040,
+        };
+
+        assert_eq!(
+            position_in_work_area(
+                PhysicalPosition::new(3700, 900),
+                PhysicalSize::new(800, 700),
+                target,
+            ),
+            PhysicalPosition::new(3040, 340)
+        );
+    }
 }

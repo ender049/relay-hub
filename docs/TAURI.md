@@ -32,6 +32,7 @@ client/tauri/
 - 剪贴板写入：`tauri-plugin-clipboard-manager`。
 - 外链打开：`tauri-plugin-opener`。
 - 与 `src/host.js` 共享同一套宿主消息协议。
+- Windows 多显示器支持：Tauri 主窗口会根据当前显示器的工作区比例自动调整普通窗口尺寸；窗口从 1080p 屏拖到 4K 屏时放大，反向移动时缩小，同时保留用户手动调整后的比例和最小尺寸约束。窗口最大化由 Windows 管理。窗口位置、尺寸和最近显示器工作区会持久化，用于下次启动恢复。
 
 ## 认证策略
 
